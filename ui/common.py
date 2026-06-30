@@ -1,8 +1,15 @@
 import streamlit as st
 
 
-def location_inputs(service_name, master, districts, headless):
-    st.markdown(f"### Fetch {service_name} Document")
+def location_inputs(
+    service_name,
+    master,
+    districts,
+    headless,
+    include_survey=True,
+    include_hissa=False,
+):
+    st.markdown(f"### Fetch {service_name.replace('_', ' ')} Document")
 
     col1, col2 = st.columns(2)
 
@@ -10,7 +17,7 @@ def location_inputs(service_name, master, districts, headless):
         district = st.selectbox(
             "District",
             ["Select District"] + districts,
-            key=f"{service_name}_district"
+            key=f"{service_name}_district",
         )
 
         if district != "Select District" and district in master:
@@ -18,14 +25,14 @@ def location_inputs(service_name, master, districts, headless):
             taluk = st.selectbox(
                 "Taluk",
                 ["Select Taluk"] + taluks,
-                key=f"{service_name}_taluk"
+                key=f"{service_name}_taluk",
             )
         else:
             taluk = st.selectbox(
                 "Taluk",
                 ["Select Taluk"],
                 disabled=True,
-                key=f"{service_name}_taluk_disabled"
+                key=f"{service_name}_taluk_disabled",
             )
 
     with col2:
@@ -34,14 +41,14 @@ def location_inputs(service_name, master, districts, headless):
             hobli = st.selectbox(
                 "Hobli",
                 ["Select Hobli"] + hoblis,
-                key=f"{service_name}_hobli"
+                key=f"{service_name}_hobli",
             )
         else:
             hobli = st.selectbox(
                 "Hobli",
                 ["Select Hobli"],
                 disabled=True,
-                key=f"{service_name}_hobli_disabled"
+                key=f"{service_name}_hobli_disabled",
             )
 
         if (
@@ -53,35 +60,38 @@ def location_inputs(service_name, master, districts, headless):
             village = st.selectbox(
                 "Village",
                 ["Select Village"] + villages,
-                key=f"{service_name}_village"
+                key=f"{service_name}_village",
             )
         else:
             village = st.selectbox(
                 "Village",
                 ["Select Village"],
                 disabled=True,
-                key=f"{service_name}_village_disabled"
+                key=f"{service_name}_village_disabled",
             )
 
-    survey_number = st.text_input(
-        "Survey Number",
-        placeholder="Enter Survey Number",
-        disabled=not (
-            district != "Select District"
-            and taluk != "Select Taluk"
-            and hobli != "Select Hobli"
-            and village != "Select Village"
-        ),
-        key=f"{service_name}_survey"
-    )
+    survey_number = ""
+
+    if include_survey:
+        survey_number = st.text_input(
+            "Survey Number",
+            placeholder="Enter Survey Number",
+            disabled=not (
+                district != "Select District"
+                and taluk != "Select Taluk"
+                and hobli != "Select Hobli"
+                and village != "Select Village"
+            ),
+            key=f"{service_name}_survey",
+        )
 
     hissa_no = ""
 
-    if service_name == "RTC":
+    if include_hissa:
         hissa_no = st.text_input(
             "Hissa Number (Optional)",
             placeholder="Example: 1, 2, A",
-            key=f"{service_name}_hissa"
+            key=f"{service_name}_hissa",
         )
 
     disabled = not (
@@ -89,8 +99,10 @@ def location_inputs(service_name, master, districts, headless):
         and taluk != "Select Taluk"
         and hobli != "Select Hobli"
         and village != "Select Village"
-        and survey_number
     )
+
+    if include_survey:
+        disabled = disabled or not survey_number
 
     payload = {
         "district": district,
@@ -99,7 +111,19 @@ def location_inputs(service_name, master, districts, headless):
         "village": village,
         "surveyNumber": survey_number,
         "hissa": hissa_no,
-        "headless": headless
+        "headless": headless,
     }
 
     return payload, disabled
+
+
+def prepare_mr_payload(payload):
+    mr_payload = payload.copy()
+
+    if (
+        mr_payload.get("district") == "BENGALURU"
+        and mr_payload.get("taluk") == "YALAHANKA"
+    ):
+        mr_payload["taluk"] = "Bangalore North(Additional)"
+
+    return mr_payload
