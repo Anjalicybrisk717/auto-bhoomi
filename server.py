@@ -6,10 +6,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 
-
 BHOOMI_URL = "https://landrecords.karnataka.gov.in/Service2/"
 MR_URL = "https://landrecords.karnataka.gov.in/Service11/MR_MutationExtract.aspx"
 REVENUE_MAP_URL = "https://landrecords.karnataka.gov.in/service3/"
+SURVEY_SKETCH_URL = "https://rdservices.karnataka.gov.in/service84/"
 
 app = FastAPI(title="Bhoomi Automation API")
 
@@ -33,6 +33,18 @@ class RevenueMapRequest(BaseModel):
     taluk: str
     hobli: str
     village: str
+    mapType: str = "All"
+    headless: bool = False
+
+
+class SurveySketchRequest(BaseModel):
+    district: str
+    taluk: str
+    hobli: str
+    village: str
+    surveyNumber: str
+    surnoc: str = ""
+    hissa: str = ""
     headless: bool = False
 
 
@@ -172,15 +184,11 @@ def fill_rtc_fields(page, data):
     selects.nth(3).select_option(label=data["village"])
     time.sleep(2)
 
-    page.locator('input[placeholder="Survey Number"]').fill(
-        str(data["surveyNumber"])
-    )
+    page.locator('input[placeholder="Survey Number"]').fill(str(data["surveyNumber"]))
 
     time.sleep(1)
 
-    go_btn = page.locator(
-        'input[value="Go"], button:has-text("Go")'
-    ).first
+    go_btn = page.locator('input[value="Go"], button:has-text("Go")').first
 
     try:
         with page.expect_navigation(
@@ -211,17 +219,16 @@ def fill_mr_fields(page, data):
     survey_input.wait_for(state="visible", timeout=30000)
     survey_input.fill(str(data["surveyNumber"]))
 
-    survey_input.evaluate(
-        """
+    survey_input.evaluate("""
         (el) => {
             el.dispatchEvent(new Event("input", { bubbles: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
             el.dispatchEvent(new Event("blur", { bubbles: true }));
         }
-        """
-    )
+        """)
 
     page.wait_for_timeout(3000)
+
 
 def select_first_option_by_index(page, index):
     dropdown = page.locator("select").nth(index)
@@ -230,14 +237,12 @@ def select_first_option_by_index(page, index):
     is_disabled = dropdown.evaluate("(ddl) => ddl.disabled")
 
     if is_disabled:
-        return dropdown.evaluate(
-            """
+        return dropdown.evaluate("""
             (ddl) => {
                 const selected = ddl.options[ddl.selectedIndex];
                 return selected ? selected.textContent.trim() : null;
             }
-            """
-        )
+            """)
 
     options = dropdown.locator("option").all()
 
@@ -268,13 +273,11 @@ def save_page_screenshot_as_pdf(browser, source_page, pdf_path):
                     size: A4 landscape;
                     margin: 5mm;
                 }}
-
                 body {{
                     margin: 0;
                     padding: 0;
                     background: white;
                 }}
-
                 img {{
                     width: 100%;
                     height: auto;
@@ -393,11 +396,9 @@ def fetch_rtc_with_playwright(data):
 
 
 def extract_mutation_rows(page):
-    return page.evaluate(
-        """
+    return page.evaluate("""
         () => {
             const rows = [];
-
             const links = Array.from(document.querySelectorAll("a"))
                 .filter(a => a.innerText.trim().toLowerCase() === "select");
 
@@ -424,8 +425,7 @@ def extract_mutation_rows(page):
 
             return rows;
         }
-        """
-    )
+        """)
 
 
 def fetch_mr_rows(data):
@@ -459,6 +459,7 @@ def fetch_mr_rows(data):
 
         finally:
             browser.close()
+
 
 def download_selected_mr(data):
     with sync_playwright() as p:
@@ -563,7 +564,6 @@ def download_selected_mr(data):
 def fill_revenue_map_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
 
-    # Use exact Revenue Map portal values
     select_dropdown_by_text_contains(page, 0, data["district"])
     page.wait_for_timeout(1500)
 
@@ -572,6 +572,10 @@ def fill_revenue_map_fields(page, data):
 
     select_dropdown_by_text_contains(page, 2, data["hobli"])
     page.wait_for_timeout(1500)
+
+    if data.get("mapType"):
+        select_dropdown_by_text_contains(page, 3, data["mapType"])
+        page.wait_for_timeout(1500)
 
 
 def fetch_revenue_map(data):
@@ -609,46 +613,67 @@ def fetch_revenue_map(data):
 
             os.makedirs("revenue_maps", exist_ok=True)
 
-            pdf_path = os.path.join(
-                "revenue_maps",
+            base_name = (
                 f"REVENUE_MAP_{safe_filename(data['district'])}_"
                 f"{safe_filename(data['taluk'])}_"
                 f"{safe_filename(data['hobli'])}_"
-                f"{safe_filename(data['village'])}.pdf",
+                f"{safe_filename(data['village'])}"
             )
 
-            pdf_url = page.evaluate(
+            file_info = page.evaluate(
                 """
                 (villageName) => {
                     const wanted = villageName.trim().toLowerCase();
                     const rows = Array.from(document.querySelectorAll("tr"));
 
                     for (const row of rows) {
-                        const rowText = row.innerText.trim().toLowerCase();
+                        const cells = Array.from(row.querySelectorAll("td"));
 
-                        if (!rowText.includes(wanted)) continue;
+                        if (cells.length < 6) continue;
 
-                        const links = Array.from(row.querySelectorAll("a"));
+                        const village = cells[3].innerText.trim().toLowerCase();
 
-                        for (const link of links) {
-                            const href = link.href || "";
+                        if (village !== wanted) continue;
 
-                            if (
-                                href.toLowerCase().includes("filedownload") ||
-                                href.toLowerCase().includes(".pdf")
-                            ) {
-                                return href;
+                        function extract(cell) {
+                            const link = cell.querySelector("a");
+
+                            if (link && link.href) {
+                                return link.href;
                             }
+
+                            const img = cell.querySelector("img");
+
+                            if (img) {
+                                const parent = img.closest("a");
+
+                                if (parent && parent.href) {
+                                    return parent.href;
+                                }
+                            }
+
+                            return null;
                         }
 
-                        const imgs = Array.from(row.querySelectorAll("img"));
+                        const pdfUrl = extract(cells[4]);
 
-                        if (imgs.length > 0) {
-                            const parentLink = imgs[0].closest("a");
-                            if (parentLink && parentLink.href) {
-                                return parentLink.href;
-                            }
+                        if (pdfUrl) {
+                            return {
+                                fileType: "pdf",
+                                url: pdfUrl
+                            };
                         }
+
+                        const kmzUrl = extract(cells[5]);
+
+                        if (kmzUrl) {
+                            return {
+                                fileType: "kmz",
+                                url: kmzUrl
+                            };
+                        }
+
+                        return null;
                     }
 
                     return null;
@@ -657,28 +682,377 @@ def fetch_revenue_map(data):
                 data["village"],
             )
 
-            if not pdf_url:
-                page.screenshot(path="revenue-map-pdf-icon-not-found.png", full_page=True)
-                raise Exception("PDF link not found for selected village")
+            if not file_info:
+                page.screenshot(
+                    path="revenue-map-no-download-file.png",
+                    full_page=True,
+                )
+                raise Exception("No PDF or KMZ file available for selected village.")
 
-            response = context.request.get(pdf_url)
+            file_type = file_info["fileType"]
+            file_url = file_info["url"]
+
+            download_path = os.path.join(
+                "revenue_maps",
+                f"{base_name}.{file_type}",
+            )
+
+            response = context.request.get(file_url)
 
             if not response.ok:
-                raise Exception("Failed to download Revenue Map PDF")
+                raise Exception(f"Failed to download {file_type.upper()} file")
 
-            with open(pdf_path, "wb") as f:
+            with open(download_path, "wb") as f:
                 f.write(response.body())
 
             return {
                 "success": True,
                 "type": "REVENUE_MAP",
-                "pdf": pdf_path,
-                "source_url": pdf_url,
+                "file_type": file_type.upper(),
+                "file": download_path,
+                "pdf": download_path if file_type == "pdf" else None,
+                "kmz": download_path if file_type == "kmz" else None,
+                "source_url": file_url,
             }
 
         except Exception as e:
             page.screenshot(path="revenue-map-error.png", full_page=True)
             raise Exception(f"Revenue Map fetch failed: {str(e)}")
+
+        finally:
+            browser.close()
+
+
+def select_visible_dropdown(page, index, value):
+    result = page.evaluate(
+        """
+        ({index, value}) => {
+            const normalize = (s) =>
+                (s || "").trim().toLowerCase().replace(/\\s+/g, " ");
+
+            const wanted = normalize(value);
+
+            const selects = Array.from(document.querySelectorAll("select"))
+                .filter(s => {
+                    const r = s.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !s.disabled;
+                });
+
+            const ddl = selects[index];
+
+            if (!ddl) {
+                return {
+                    success: false,
+                    reason: "Dropdown not found",
+                    count: selects.length
+                };
+            }
+
+            const options = Array.from(ddl.options);
+
+            for (const option of options) {
+                const text = normalize(option.textContent);
+
+                if (
+                    text &&
+                    !text.includes("select") &&
+                    (
+                        text === wanted ||
+                        text.includes(wanted) ||
+                        wanted.includes(text)
+                    )
+                ) {
+                    ddl.value = option.value;
+                    ddl.dispatchEvent(new Event("input", { bubbles: true }));
+                    ddl.dispatchEvent(new Event("change", { bubbles: true }));
+
+                    return {
+                        success: true,
+                        selected: option.textContent.trim()
+                    };
+                }
+            }
+
+            return {
+                success: false,
+                reason: "Option not found",
+                options: options.map(o => o.textContent.trim())
+            };
+        }
+        """,
+        {"index": index, "value": value},
+    )
+
+    if not result.get("success"):
+        raise Exception(
+            f"Could not select '{value}' in visible dropdown {index}. Details: {result}"
+        )
+
+    print(f"Selected visible dropdown {index}: {result.get('selected')}")
+    page.wait_for_timeout(2500)
+
+
+def fetch_survey_sketch(data):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=data.get("headless", False),
+            slow_mo=300,
+        )
+
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1920, "height": 1400},
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(
+                SURVEY_SKETCH_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+
+            page.wait_for_timeout(4000)
+
+            checkbox = page.locator('input[type="checkbox"]').first
+            checkbox.wait_for(state="visible", timeout=30000)
+
+            if not checkbox.is_checked():
+                checkbox.check(force=True)
+
+            page.wait_for_timeout(3000)
+
+            def select_dropdown(index, value):
+                result = page.evaluate(
+                    """
+                    ({index, value}) => {
+                        const normalize = s =>
+                            (s || "").trim().toLowerCase().replace(/\\s+/g, " ");
+
+                        const wanted = normalize(value);
+
+                        const selects = Array.from(document.querySelectorAll("select"))
+                            .filter(s => {
+                                const r = s.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0 && !s.disabled;
+                            });
+
+                        const ddl = selects[index];
+                        if (!ddl) return {success:false, reason:"Dropdown not found", count:selects.length};
+
+                        const options = Array.from(ddl.options);
+
+                        const option = options.find(o => {
+                            const text = normalize(o.textContent);
+                            return text &&
+                                   !text.includes("select") &&
+                                   (
+                                       text === wanted ||
+                                       text.includes(wanted) ||
+                                       wanted.includes(text)
+                                   );
+                        });
+
+                        if (!option) {
+                            return {
+                                success:false,
+                                reason:"Option not found",
+                                wanted:value,
+                                options: options.map(o => o.textContent.trim())
+                            };
+                        }
+
+                        ddl.value = option.value;
+                        ddl.dispatchEvent(new Event("input", {bubbles:true}));
+                        ddl.dispatchEvent(new Event("change", {bubbles:true}));
+                        ddl.dispatchEvent(new Event("blur", {bubbles:true}));
+
+                        return {success:true, selected:option.textContent.trim()};
+                    }
+                    """,
+                    {"index": index, "value": value},
+                )
+
+                if not result.get("success"):
+                    raise Exception(result)
+
+                page.wait_for_timeout(3000)
+
+            select_dropdown(0, data["district"])
+            select_dropdown(1, data["taluk"])
+            select_dropdown(2, data["hobli"])
+            select_dropdown(3, data["village"])
+
+            survey_filled = page.evaluate(
+                """
+                (surveyNumber) => {
+                    const inputs = Array.from(document.querySelectorAll("input"))
+                        .filter(input => {
+                            const r = input.getBoundingClientRect();
+                            const type = (input.type || "").toLowerCase();
+                            return r.width > 0 &&
+                                   r.height > 0 &&
+                                   !input.disabled &&
+                                   type !== "checkbox" &&
+                                   type !== "button" &&
+                                   type !== "submit";
+                        });
+
+                    if (inputs.length < 2) return false;
+
+                    const surveyInput = inputs[1];
+                    surveyInput.focus();
+                    surveyInput.value = "";
+                    surveyInput.dispatchEvent(new Event("input", {bubbles:true}));
+
+                    surveyInput.value = surveyNumber;
+                    surveyInput.dispatchEvent(new Event("input", {bubbles:true}));
+                    surveyInput.dispatchEvent(new Event("change", {bubbles:true}));
+                    surveyInput.dispatchEvent(new KeyboardEvent("keyup", {bubbles:true}));
+                    surveyInput.dispatchEvent(new Event("blur", {bubbles:true}));
+
+                    return true;
+                }
+                """,
+                str(data["surveyNumber"]),
+            )
+
+            if not survey_filled:
+                raise Exception("Survey No field not found")
+
+            page.wait_for_timeout(5000)
+
+            page.wait_for_function(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll("select"))
+                        .filter(s => {
+                            const r = s.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 && !s.disabled;
+                        });
+
+                    return selects.length >= 5 && selects[4].options.length > 1;
+                }
+                """,
+                timeout=30000,
+            )
+
+            select_dropdown(4, data.get("surnoc", "*"))
+
+            page.wait_for_function(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll("select"))
+                        .filter(s => {
+                            const r = s.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 && !s.disabled;
+                        });
+
+                    return selects.length >= 6 && selects[5].options.length > 1;
+                }
+                """,
+                timeout=30000,
+            )
+
+            select_dropdown(5, data.get("hissa", "*"))
+
+            search_clicked = page.evaluate(
+                """
+                () => {
+                    const items = Array.from(document.querySelectorAll("button, input, a"));
+
+                    const btn = items.find(el => {
+                        const text = (el.innerText || el.value || "")
+                            .trim()
+                            .toLowerCase();
+
+                        return text.includes("search");
+                    });
+
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }
+                """
+            )
+
+            if not search_clicked:
+                raise Exception("Search button not found")
+
+            page.wait_for_timeout(10000)
+
+            view_clicked = page.evaluate(
+                """
+                () => {
+                    const items = Array.from(document.querySelectorAll("button, input, a, span, div"));
+
+                    const btn = items.find(el => {
+                        const text = (el.innerText || el.value || "")
+                            .trim()
+                            .toLowerCase();
+
+                        return text.includes("view sketch on map");
+                    });
+
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }
+                """
+            )
+
+            if not view_clicked:
+                raise Exception("View Sketch On Map button not found")
+
+            page.wait_for_timeout(12000)
+
+            os.makedirs("survey_sketch_downloads", exist_ok=True)
+
+            base_name = (
+                f"SURVEY_SKETCH_{safe_filename(data['district'])}_"
+                f"{safe_filename(data['taluk'])}_"
+                f"{safe_filename(data['village'])}_"
+                f"{safe_filename(data['surveyNumber'])}"
+            )
+
+            image_path = os.path.join(
+                "survey_sketch_downloads",
+                f"{base_name}_MAP.png",
+            )
+
+            pdf_path = os.path.join(
+                "survey_sketch_downloads",
+                f"{base_name}_MAP.pdf",
+            )
+
+            page.screenshot(
+                path=image_path,
+                full_page=True,
+            )
+
+            page.pdf(
+                path=pdf_path,
+                width="48in",
+                height="36in",
+                print_background=True,
+                margin={
+                    "top": "0.25in",
+                    "right": "0.25in",
+                    "bottom": "0.25in",
+                    "left": "0.25in",
+                },
+            )
+
+            return {
+                "success": True,
+                "type": "SURVEY_SKETCH_MAP",
+                "image": image_path,
+                "pdf": pdf_path,
+            }
+
+        except Exception as e:
+            page.screenshot(path="survey-sketch-error.png", full_page=True)
+            raise Exception(f"Survey Sketch fetch failed: {str(e)}")
 
         finally:
             browser.close()
@@ -715,64 +1089,13 @@ def revenue_map_fetch(data: RevenueMapRequest):
         raise HTTPException(status_code=500, detail=str(error))
 
 
-@app.post("/api/revenue-map/options")
-def revenue_map_options(data: dict):
+@app.post("/api/survey-sketch/fetch")
+def survey_sketch_fetch(data: SurveySketchRequest):
     try:
-        level = data.get("level", "district")
-        district = data.get("district")
-        taluk = data.get("taluk")
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            page.goto(
-                REVENUE_MAP_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-
-            page.wait_for_selector("select", timeout=30000)
-
-            if level in ["taluk", "hobli"] and district:
-                page.locator("select").nth(0).select_option(label=district)
-                page.wait_for_timeout(2000)
-
-            if level == "hobli" and taluk:
-                page.locator("select").nth(1).select_option(label=taluk)
-                page.wait_for_timeout(2000)
-
-            index_map = {
-                "district": 0,
-                "taluk": 1,
-                "hobli": 2,
-            }
-
-            index = index_map[level]
-
-            options = page.locator("select").nth(index).locator("option").evaluate_all(
-                """
-                opts => opts
-                    .map(o => o.textContent.trim())
-                    .filter(t =>
-                        t &&
-                        t.toLowerCase() !== "all" &&
-                        !t.toLowerCase().includes("select")
-                    )
-                """
-            )
-
-            browser.close()
-
-            return {
-                "success": True,
-                "options": options,
-            }
-
+        return fetch_survey_sketch(data.model_dump())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
 if __name__ == "__main__":
     uvicorn.run(
         app,

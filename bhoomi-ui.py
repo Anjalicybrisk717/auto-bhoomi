@@ -1,6 +1,6 @@
 import json
 import streamlit as st
-
+from ui.survey_sketch_ui import render_survey_sketch_ui
 from ui.rtc_ui import render_rtc_ui
 from ui.mr_ui import render_mr_ui
 from ui.revenue_map_ui import render_revenue_map_ui
@@ -197,6 +197,14 @@ with tabs[0]:
                 districts,
                 headless,
             )
+
+        elif bhoomi_service == "Survey Sketch":
+            render_survey_sketch_ui(
+                API_BASE,
+                master,
+                districts,
+                headless,
+      )
 
         elif bhoomi_service != "Select Service":
             st.info(f"{bhoomi_service} automation will be added next.")

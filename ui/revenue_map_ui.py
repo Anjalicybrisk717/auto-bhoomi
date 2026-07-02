@@ -3,7 +3,7 @@ import streamlit as st
 import requests
 
 
-def load_revenue_map_master():
+def load_revenue_master():
     try:
         with open("revenue-map-master.json", "r", encoding="utf-8") as f:
             return json.load(f)
@@ -15,89 +15,109 @@ def load_revenue_map_master():
         return {}
 
 
+def get_hobli_node(revenue_master, district, taluk, hobli):
+    try:
+        node = revenue_master[district][taluk][hobli]
+        if isinstance(node, dict):
+            return node
+        if isinstance(node, list):
+            return {
+                "_villages": node,
+                "_map_types": ["Cadastral Maps", "Geo-referenced Cadastral Maps"],
+            }
+        return {
+            "_villages": [],
+            "_map_types": ["Cadastral Maps", "Geo-referenced Cadastral Maps"],
+        }
+    except Exception:
+        return {
+            "_villages": [],
+            "_map_types": ["Cadastral Maps", "Geo-referenced Cadastral Maps"],
+        }
+
+
 def render_revenue_map_ui(api_base, master, districts, headless):
     st.markdown("### Fetch Revenue Map Document")
 
-    revenue_master = load_revenue_map_master()
-
+    revenue_master = load_revenue_master()
     if not revenue_master:
         return
-
-    revenue_districts = list(revenue_master.keys())
 
     col1, col2 = st.columns(2)
 
     with col1:
         district = st.selectbox(
             "District",
-            ["Select District"] + revenue_districts,
+            ["Select District"] + list(revenue_master.keys()),
             key="Revenue_Map_district",
         )
 
         if district != "Select District":
             taluks = list(revenue_master[district].keys())
-            taluk = st.selectbox(
-                "Taluk",
-                ["Select Taluk"] + taluks,
-                key="Revenue_Map_taluk",
-            )
         else:
-            taluk = st.selectbox(
-                "Taluk",
-                ["Select Taluk"],
-                disabled=True,
-                key="Revenue_Map_taluk_disabled",
-            )
+            taluks = []
+
+        taluk = st.selectbox(
+            "Taluk",
+            ["Select Taluk"] + taluks,
+            disabled=district == "Select District",
+            key="Revenue_Map_taluk",
+        )
 
     with col2:
         if district != "Select District" and taluk != "Select Taluk":
             hoblis = list(revenue_master[district][taluk].keys())
-            hobli = st.selectbox(
-                "Hobli",
-                ["Select Hobli"] + hoblis,
-                key="Revenue_Map_hobli",
-            )
         else:
-            hobli = st.selectbox(
-                "Hobli",
-                ["Select Hobli"],
-                disabled=True,
-                key="Revenue_Map_hobli_disabled",
-            )
+            hoblis = []
+
+        hobli = st.selectbox(
+            "Hobli",
+            ["Select Hobli"] + hoblis,
+            disabled=taluk == "Select Taluk",
+            key="Revenue_Map_hobli",
+        )
 
         if (
             district != "Select District"
             and taluk != "Select Taluk"
             and hobli != "Select Hobli"
         ):
-            villages = revenue_master[district][taluk][hobli]
-
-            if isinstance(villages, list) and villages:
-                village = st.selectbox(
-                    "Village",
-                    ["Select Village"] + villages,
-                    key="Revenue_Map_village",
-                )
-            else:
-                village = st.text_input(
-                    "Village",
-                    placeholder="Enter village name exactly as in portal",
-                    key="Revenue_Map_village_text",
-                )
-        else:
-            village = st.selectbox(
-                "Village",
-                ["Select Village"],
-                disabled=True,
-                key="Revenue_Map_village_disabled",
+            node = get_hobli_node(
+                revenue_master,
+                district,
+                taluk,
+                hobli,
             )
+
+            villages = node.get("_villages", [])
+            map_types = node.get(
+                "_map_types",
+                ["Cadastral Maps", "Geo-referenced Cadastral Maps"],
+            )
+        else:
+            villages = []
+            map_types = ["Cadastral Maps", "Geo-referenced Cadastral Maps"]
+
+        village = st.selectbox(
+            "Village",
+            ["Select Village"] + villages,
+            disabled=hobli == "Select Hobli",
+            key="Revenue_Map_village",
+        )
+
+    map_type = st.selectbox(
+        "Map Type",
+        ["All"] + map_types,
+        disabled=hobli == "Select Hobli",
+        key="Revenue_Map_map_type",
+    )
 
     disabled = not (
         district != "Select District"
         and taluk != "Select Taluk"
         and hobli != "Select Hobli"
-        and village
         and village != "Select Village"
+        and map_type
     )
 
     payload = {
@@ -105,6 +125,7 @@ def render_revenue_map_ui(api_base, master, districts, headless):
         "taluk": taluk,
         "hobli": hobli,
         "village": village,
+        "mapType": map_type,
         "headless": headless,
     }
 

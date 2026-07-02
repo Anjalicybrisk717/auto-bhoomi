@@ -34,6 +34,8 @@ class DropdownRequest(BaseModel):
     district: str | None = None
     taluk: str | None = None
     hobli: str | None = None
+
+
 def clean_options(options):
     values = []
     for option in options:
@@ -73,125 +75,117 @@ def fetch_rtc_with_playwright(data):
             page.locator('input[placeholder="Survey Number"]').fill(
                 data["surveyNumber"]
             )
-            
-           page.get_by_role("button", name="Go").click()
-time.sleep(5)
 
-# SURNOC
-surnoc = page.locator("#ctl00_MainContent_ddlCSurnoc")
-surnoc.wait_for(state="visible", timeout=30000)
+            page.get_by_role("button", name="Go").click()
+            time.sleep(5)
 
-options = surnoc.locator("option").all()
+            # SURNOC
+            surnoc = page.locator("#ctl00_MainContent_ddlCSurnoc")
+            surnoc.wait_for(state="visible", timeout=30000)
 
-selected_surnoc = None
+            options = surnoc.locator("option").all()
+            selected_surnoc = None
 
-for option in options:
-    text = option.inner_text().strip()
-    value = option.get_attribute("value")
+            for option in options:
+                text = option.inner_text().strip()
+                value = option.get_attribute("value")
 
-    if value and value != "0" and "select" not in text.lower():
-        surnoc.select_option(value=value)
-        selected_surnoc = text
-        break
+                if value and value != "0" and "select" not in text.lower():
+                    surnoc.select_option(value=value)
+                    selected_surnoc = text
+                    break
 
-time.sleep(2)
+            time.sleep(2)
 
-# HISSA
-hissa = page.locator("#ctl00_MainContent_ddlCHissa")
-hissa.wait_for(state="visible", timeout=30000)
+            # HISSA
+            hissa = page.locator("#ctl00_MainContent_ddlCHissa")
+            hissa.wait_for(state="visible", timeout=30000)
 
-options = hissa.locator("option").all()
+            options = hissa.locator("option").all()
+            selected_hissa = None
 
-selected_hissa = None
+            for option in options:
+                text = option.inner_text().strip()
+                value = option.get_attribute("value")
 
-for option in options:
-    text = option.inner_text().strip()
-    value = option.get_attribute("value")
+                if value and value != "0" and "select" not in text.lower():
+                    hissa.select_option(value=value)
+                    selected_hissa = text
+                    break
 
-    if value and value != "0" and "select" not in text.lower():
-        hissa.select_option(value=value)
-        selected_hissa = text
-        break
+            time.sleep(2)
 
-time.sleep(2)
+            # PERIOD
+            period = page.locator("#ctl00_MainContent_ddlCPeriod")
+            period.wait_for(state="visible", timeout=30000)
 
-# PERIOD
-period = page.locator("#ctl00_MainContent_ddlCPeriod")
-period.wait_for(state="visible", timeout=30000)
+            options = period.locator("option").all()
+            selected_period = None
 
-options = period.locator("option").all()
+            for option in options:
+                text = option.inner_text().strip()
+                value = option.get_attribute("value")
 
-selected_period = None
+                if value and value != "0" and "select" not in text.lower():
+                    period.select_option(value=value)
+                    selected_period = text
+                    break
 
-for option in options:
-    text = option.inner_text().strip()
-    value = option.get_attribute("value")
+            time.sleep(2)
 
-    if value and value != "0" and "select" not in text.lower():
-        period.select_option(value=value)
-        selected_period = text
-        break
+            page.locator(
+                'input[value="Fetch details"], button:has-text("Fetch details")'
+            ).first.click()
 
-time.sleep(2)
+            print("Fetch Details clicked")
+            page.wait_for_timeout(8000)
 
-# FETCH DETAILS
-page.locator(
-    'input[value="Fetch details"], button:has-text("Fetch details")'
-).first.click()
+            page.wait_for_selector(
+                'input[value="View"], button:has-text("View")',
+                timeout=30000
+            )
 
-print("Fetch Details clicked")
+            with page.context.expect_page() as new_page_info:
+                page.locator(
+                    'input[value="View"], button:has-text("View")'
+                ).first.click()
 
-page.wait_for_timeout(8000)
+            print("View clicked")
 
-# Wait for View button
-page.wait_for_selector(
-    'input[value="View"], button:has-text("View")',
-    timeout=30000
-)
+            rtc_page = new_page_info.value
+            rtc_page.wait_for_load_state()
 
-# Click View
-page.locator(
-    'input[value="View"], button:has-text("View")'
-).first.click()
+            download_dir = "rtc_downloads"
+            os.makedirs(download_dir, exist_ok=True)
 
-print("View clicked")
+            pdf_path = os.path.join(
+                download_dir,
+                f"RTC_{data['district']}_{data['surveyNumber']}.pdf"
+            )
 
-page.wait_for_timeout(10000)
-with page.context.expect_page() as new_page_info:
+            rtc_page.pdf(
+                path=pdf_path,
+                format="A4",
+                print_background=True
+            )
 
-    page.locator(
-        'input[value="View"], button:has-text("View")'
-    ).first.click()
+            print("RTC PDF saved")
 
-rtc_page = new_page_info.value
+            return {
+                "success": True,
+                "engine": "playwright",
+                "selected_surnoc": selected_surnoc,
+                "selected_hissa": selected_hissa,
+                "selected_period": selected_period,
+                "pdf": pdf_path
+            }
 
-rtc_page.wait_for_load_state()
+        finally:
+            browser.close()
 
-pdf_path = os.path.join(
-    download_dir,
-    f"RTC_{data['district']}_{data['surveyNumber']}.pdf"
-)
 
-rtc_page.pdf(
-    path=pdf_path,
-    format="A4",
-    print_background=True
-)
-
-print("RTC PDF saved")
-# page.screenshot(path="rtc-playwright-result.png", full_page=True)
-
-return {
-    "success": True,
-    "engine": "playwright",
-    "selected_surnoc": selected_surnoc,
-    "selected_hissa": selected_hissa,
-    "selected_period": selected_period,
-    "pdf": pdf_path
-}
-
-    finally:
-        driver.quit()
+def fetch_rtc_with_selenium(data):
+    return fetch_rtc_with_playwright(data)
 
 
 @app.post("/api/fetch-rtc/playwright")

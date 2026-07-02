@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+rtc_downloads/
+mr_downloads/
+revenue_maps/
+survey_sketch_downloads/
+
+*-error.png
+*-debug.png
