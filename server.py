@@ -1,7 +1,10 @@
 import os
+import re
 import time
+import json
 import base64
 import uvicorn
+import unicodedata
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
@@ -10,6 +13,10 @@ BHOOMI_URL = "https://landrecords.karnataka.gov.in/Service2/"
 MR_URL = "https://landrecords.karnataka.gov.in/Service11/MR_MutationExtract.aspx"
 REVENUE_MAP_URL = "https://landrecords.karnataka.gov.in/service3/"
 SURVEY_SKETCH_URL = "https://rdservices.karnataka.gov.in/service84/"
+AKARBAND_URL = "https://bhoomojini.karnataka.gov.in/service39/"
+
+with open("bhoomi-master-bilingual.json", "r", encoding="utf-8") as f:
+    bilingual_master = json.load(f)
 
 app = FastAPI(title="Bhoomi Automation API")
 
@@ -48,6 +55,17 @@ class SurveySketchRequest(BaseModel):
     headless: bool = False
 
 
+class AkarbandRequest(BaseModel):
+    district: str
+    taluk: str
+    hobli: str
+    village: str
+    surveyNumber: str
+    surnoc: str = ""
+    hissa: str = ""
+    headless: bool = False
+    
+
 def safe_filename(value):
     return (
         str(value)
@@ -58,75 +76,97 @@ def safe_filename(value):
         .replace(")", "")
     )
 
+def normalize_text(text: str) -> str:
+    if text is None:
+        return ""
+
+    text = unicodedata.normalize("NFKC", str(text))
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip().lower()
 
 def select_dropdown_by_text_contains(page, index, wanted_text):
-    dropdown = page.locator("select").nth(index)
-    dropdown.wait_for(state="visible", timeout=30000)
+    wanted = normalize_text(wanted_text)
 
-    selected = dropdown.evaluate(
+    result = page.evaluate(
         """
-        (ddl, wantedText) => {
-            const normalize = (s) =>
-                (s || "").trim().toLowerCase().replace(/\\s+/g, " ");
+        ({index, wanted}) => {
 
-            const wanted = normalize(wantedText);
-            const options = Array.from(ddl.options);
+            function normalize(s){
+                if(!s) return "";
 
-            for (const option of options) {
-                const text = normalize(option.textContent);
+                return s
+                    .normalize("NFKC")
+                    .replace(/\\u00a0/g," ")
+                    .replace(/\\s+/g," ")
+                    .trim()
+                    .toLowerCase();
+            }
 
-                if (
-                    text &&
-                    !text.includes("select") &&
-                    (
-                        text === wanted ||
-                        text.includes(wanted) ||
-                        wanted.includes(text)
-                    )
-                ) {
-                    ddl.value = option.value;
-                    ddl.dispatchEvent(new Event("input", { bubbles: true }));
-                    ddl.dispatchEvent(new Event("change", { bubbles: true }));
-                    return option.textContent.trim();
+            const selects = Array.from(document.querySelectorAll("select"))
+                .filter(s=>{
+                    const r=s.getBoundingClientRect();
+
+                    return (
+                        r.width>0 &&
+                        r.height>0 &&
+                        !s.disabled
+                    );
+                });
+
+            if(index>=selects.length){
+                return {
+                    success:false,
+                    message:"Dropdown not found",
+                    count:selects.length
+                };
+            }
+
+            const ddl=selects[index];
+
+            const options=Array.from(ddl.options);
+
+            for(const option of options){
+
+                const txt=normalize(option.textContent);
+
+                if(
+                    txt===wanted ||
+                    txt.includes(wanted) ||
+                    wanted.includes(txt)
+                ){
+
+                    ddl.value=option.value;
+
+                    ddl.dispatchEvent(new Event("input",{bubbles:true}));
+                    ddl.dispatchEvent(new Event("change",{bubbles:true}));
+
+                    return{
+                        success:true,
+                        selected:option.textContent.trim()
+                    };
                 }
             }
 
-            if (wanted.includes("yalahanka") || wanted.includes("yelahanka")) {
-                for (const option of options) {
-                    const text = normalize(option.textContent);
+            return{
+                success:false,
+                wanted:wanted,
+                options:options.map(o=>o.textContent.trim())
+            };
 
-                    if (
-                        text.includes("bangalore north") ||
-                        text.includes("bengaluru north") ||
-                        text.includes("additional")
-                    ) {
-                        ddl.value = option.value;
-                        ddl.dispatchEvent(new Event("input", { bubbles: true }));
-                        ddl.dispatchEvent(new Event("change", { bubbles: true }));
-                        return option.textContent.trim();
-                    }
-                }
-            }
-
-            return null;
         }
         """,
-        wanted_text,
+        {
+            "index": index,
+            "wanted": wanted,
+        },
     )
 
-    page.wait_for_timeout(2500)
+    if not result["success"]:
+        raise Exception(result)
 
-    if not selected:
-        options = dropdown.locator("option").evaluate_all(
-            "opts => opts.map(o => o.textContent.trim())"
-        )
-        raise Exception(
-            f"Could not select '{wanted_text}' in dropdown {index}. Options: {options}"
-        )
-
-    print(f"Selected dropdown {index}: {selected}")
-    return selected
-
+    page.wait_for_timeout(2000)
 
 def click_button_by_text(page, button_text):
     clicked = page.evaluate(
@@ -170,37 +210,45 @@ def click_fetch_details(page):
 def fill_rtc_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
 
-    selects = page.locator("select")
+    select_dropdown_by_text_contains(page, 0, data["district"])
+    page.wait_for_timeout(2000)
 
-    selects.nth(0).select_option(label=data["district"])
-    time.sleep(2)
+    select_dropdown_by_text_contains(page, 1, data["taluk"])
+    page.wait_for_timeout(2000)
 
-    selects.nth(1).select_option(label=data["taluk"])
-    time.sleep(2)
+    select_dropdown_by_text_contains(page, 2, data["hobli"])
+    page.wait_for_timeout(2000)
 
-    selects.nth(2).select_option(label=data["hobli"])
-    time.sleep(2)
+    select_dropdown_by_text_contains(page, 3, data["village"])
+    page.wait_for_timeout(2000)
 
-    selects.nth(3).select_option(label=data["village"])
-    time.sleep(2)
+    survey_input = page.locator(
+        'input[placeholder="Survey Number"], input[type="text"]'
+    ).first
 
-    page.locator('input[placeholder="Survey Number"]').fill(str(data["surveyNumber"]))
+    survey_input.wait_for(state="visible", timeout=30000)
+    survey_input.fill(str(data["surveyNumber"]))
 
-    time.sleep(1)
+    survey_input.evaluate(
+        """
+        (el) => {
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            el.dispatchEvent(new Event("blur", { bubbles: true }));
+        }
+        """
+    )
 
-    go_btn = page.locator('input[value="Go"], button:has-text("Go")').first
+    page.wait_for_timeout(1000)
 
-    try:
-        with page.expect_navigation(
-            wait_until="domcontentloaded",
-            timeout=15000,
-        ):
-            go_btn.click()
-    except Exception:
-        go_btn.click()
+    go_btn = page.locator(
+        'input[value="Go"], button:has-text("Go"), a:has-text("Go")'
+    ).first
 
-    page.wait_for_timeout(10000)
+    go_btn.wait_for(state="visible", timeout=30000)
+    go_btn.click(force=True)
 
+    page.wait_for_timeout(8000)
 
 def fill_mr_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
@@ -310,12 +358,6 @@ def save_page_screenshot_as_pdf(browser, source_page, pdf_path):
 
 
 def save_rtc_pdf(page, data):
-    view_btn = page.locator(
-        'input[value="View"], button:has-text("View"), a:has-text("View")'
-    ).first
-
-    view_btn.wait_for(state="visible", timeout=30000)
-
     os.makedirs("rtc_downloads", exist_ok=True)
 
     pdf_path = os.path.join(
@@ -326,30 +368,69 @@ def save_rtc_pdf(page, data):
         f"{safe_filename(data['surveyNumber'])}.pdf",
     )
 
+    page.wait_for_function(
+        """
+        () => {
+            const text = document.body.innerText.toLowerCase();
+            return (
+                text.includes("owner") ||
+                text.includes("extent") ||
+                text.includes("rtc documents") ||
+                text.includes("land id")
+            );
+        }
+        """,
+        timeout=60000,
+    )
+
+    page.wait_for_timeout(3000)
+
+    view_clicked = page.evaluate(
+        """
+        () => {
+            const items = Array.from(document.querySelectorAll("input, button, a"));
+
+            const btn = items.find(el => {
+                const text = (el.innerText || el.value || "")
+                    .trim()
+                    .toLowerCase();
+
+                return text === "view" || text.includes("view");
+            });
+
+            if (!btn) return false;
+
+            btn.removeAttribute("disabled");
+            btn.disabled = false;
+            btn.click();
+            return true;
+        }
+        """
+    )
+
+    if not view_clicked:
+        page.screenshot(path="rtc-view-button-not-found.png", full_page=True)
+        raise Exception("RTC View button not found after Fetch Details")
+
+    page.wait_for_timeout(7000)
+
+    pages = page.context.pages
+    preview_page = pages[-1] if len(pages) > 1 else page
+
+    preview_page.wait_for_timeout(5000)
+
     try:
-        with page.context.expect_page(timeout=15000) as new_page:
-            view_btn.click(force=True)
-
-        preview_page = new_page.value
-        preview_page.wait_for_load_state("domcontentloaded")
-        preview_page.wait_for_timeout(7000)
-
         preview_page.pdf(
             path=pdf_path,
             format="A4",
             landscape=True,
             print_background=True,
         )
-
     except Exception:
-        view_btn.click(force=True)
-        page.wait_for_timeout(7000)
-
-        page.pdf(
-            path=pdf_path,
-            format="A4",
-            landscape=True,
-            print_background=True,
+        save_page_screenshot_as_pdf(
+            page.context.browser,
+            preview_page,
+            pdf_path,
         )
 
     return pdf_path
@@ -375,6 +456,21 @@ def fetch_rtc_with_playwright(data):
 
             click_fetch_details(page)
 
+            page.wait_for_function(
+                """
+                () => {
+                    const text = document.body.innerText.toLowerCase();
+                    return (
+                        text.includes("owner") ||
+                        text.includes("extent") ||
+                        text.includes("rtc documents") ||
+                        text.includes("land id")
+                    );
+                }
+                """,
+                timeout=60000,
+            )
+
             pdf_path = save_rtc_pdf(page, data)
 
             return {
@@ -393,7 +489,6 @@ def fetch_rtc_with_playwright(data):
 
         finally:
             browser.close()
-
 
 def extract_mutation_rows(page):
     return page.evaluate("""
@@ -1057,6 +1152,145 @@ def fetch_survey_sketch(data):
         finally:
             browser.close()
 
+def fetch_akarband(data):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=data.get("headless", False),
+            slow_mo=300,
+            args=["--lang=kn-IN", "--disable-features=Translate"],
+        )
+
+        context = browser.new_context(
+            accept_downloads=True,
+            locale="kn-IN",
+        )
+
+        page = context.new_page()
+
+        try:
+            page.goto(
+                AKARBAND_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+
+            page.wait_for_selector("select", timeout=30000)
+
+            select_dropdown_by_text_contains(page, 0, data["district"])
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 1, data["taluk"])
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 2, data["hobli"])
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 3, data["village"])
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 4, data["surveyNumber"])
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 5, data.get("surnoc", "*"))
+            page.wait_for_timeout(2000)
+
+            select_dropdown_by_text_contains(page, 6, data.get("hissa", "*"))
+            page.wait_for_timeout(2000)
+
+            os.makedirs("akarband_downloads", exist_ok=True)
+
+            pdf_path = os.path.join(
+                "akarband_downloads",
+                f"AKARBAND_{safe_filename(data['district'])}_"
+                f"{safe_filename(data['taluk'])}_"
+                f"{safe_filename(data['village'])}_"
+                f"{safe_filename(data['surveyNumber'])}.pdf",
+            )
+
+            button = page.locator(
+                'button:has-text("ಆಕಾರಬಂದ್"), '
+                'input[value*="ಆಕಾರಬಂದ್"], '
+                'a:has-text("ಆಕಾರಬಂದ್")'
+            ).first
+
+            button.wait_for(state="visible", timeout=30000)
+
+            try:
+                with page.context.expect_page(timeout=15000) as popup_info:
+                    button.click(force=True)
+
+                result_page = popup_info.value
+                result_page.wait_for_load_state("domcontentloaded", timeout=60000)
+                result_page.wait_for_timeout(7000)
+
+                result_page.pdf(
+                    path=pdf_path,
+                    format="A4",
+                    landscape=True,
+                    print_background=True,
+                )
+
+            except Exception:
+                button.click(force=True)
+                page.wait_for_timeout(7000)
+
+                page.pdf(
+                    path=pdf_path,
+                    format="A4",
+                    landscape=True,
+                    print_background=True,
+                )
+
+            return {
+                "success": True,
+                "type": "AKARBAND",
+                "pdf": pdf_path,
+            }
+
+        except Exception as e:
+            page.screenshot(path="akarband-error.png", full_page=True)
+            raise Exception(f"Akarband fetch failed: {str(e)}")
+
+        finally:
+            browser.close()
+
+def get_node_portal_value(node, fallback):
+    if isinstance(node, dict):
+        return (
+            node.get("portal")
+            or node.get("label")
+            or node.get("kn")
+            or node.get("en")
+            or fallback
+        )
+
+    if isinstance(node, str):
+        return node
+
+    return fallback
+
+
+def get_portal_location_values(data):
+    district = data["district"]
+    taluk = data["taluk"]
+    hobli = data["hobli"]
+    village = data["village"]
+
+    district_node = bilingual_master[district]
+    district_value = get_node_portal_value(district_node, district)
+
+    taluk_node = district_node["taluks"][taluk]
+    taluk_value = get_node_portal_value(taluk_node, taluk)
+
+    hobli_node = taluk_node["hoblis"][hobli]
+    hobli_value = get_node_portal_value(hobli_node, hobli)
+
+    village_node = hobli_node["villages"][village]
+    village_value = get_node_portal_value(village_node, village)
+
+    return district_value, taluk_value, hobli_value, village_value
+
+
 @app.post("/api/fetch-rtc/auto")
 def fetch_rtc_auto(data: BhoomiRequest):
     try:
@@ -1095,6 +1329,14 @@ def survey_sketch_fetch(data: SurveySketchRequest):
         return fetch_survey_sketch(data.model_dump())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/akarband/fetch")
+def akarband_fetch(data: AkarbandRequest):
+    try:
+        return fetch_akarband(data.model_dump())
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
     
 if __name__ == "__main__":
     uvicorn.run(

@@ -4,6 +4,7 @@ from ui.survey_sketch_ui import render_survey_sketch_ui
 from ui.rtc_ui import render_rtc_ui
 from ui.mr_ui import render_mr_ui
 from ui.revenue_map_ui import render_revenue_map_ui
+from ui.akarband_ui import render_akarband_ui
 
 
 API_BASE = "http://localhost:5000"
@@ -165,6 +166,7 @@ with tabs[0]:
                 "MR",
                 "Revenue Map",
                 "Mutation Status",
+                "Akarband",
                 "Khata Extract",
                 "Survey Document",
                 "RTC With Sketch",
@@ -204,7 +206,14 @@ with tabs[0]:
                 master,
                 districts,
                 headless,
-      )
+          )
+        elif bhoomi_service == "Akarband":
+            render_akarband_ui(
+                API_BASE,
+                master,
+                districts,
+                headless,
+        )
 
         elif bhoomi_service != "Select Service":
             st.info(f"{bhoomi_service} automation will be added next.")

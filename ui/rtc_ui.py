@@ -1,5 +1,5 @@
-import streamlit as st
 import requests
+import streamlit as st
 
 from ui.common import location_inputs
 
@@ -15,7 +15,7 @@ def render_rtc_ui(api_base, master, districts, headless):
     )
 
     if st.button(
-        "📥 Download RTC",
+        "Download RTC",
         disabled=disabled,
         use_container_width=True,
     ):
@@ -30,34 +30,27 @@ def render_rtc_ui(api_base, master, districts, headless):
             result = response.json()
 
             if result.get("success"):
-
                 st.success("RTC downloaded successfully.")
 
                 col1, col2, col3 = st.columns(3)
 
                 with col1:
-                    st.metric(
-                        "Surnoc",
-                        result.get("selected_surnoc", "-"),
-                    )
+                    st.metric("Surnoc", result.get("selected_surnoc", "-"))
 
                 with col2:
-                    st.metric(
-                        "Hissa",
-                        result.get("selected_hissa", "-"),
-                    )
+                    st.metric("Hissa", result.get("selected_hissa", "-"))
 
                 with col3:
-                    st.metric(
-                        "Period",
-                        result.get("selected_period", "-"),
-                    )
+                    st.metric("Period", result.get("selected_period", "-"))
 
                 if result.get("pdf"):
                     st.info(f"Saved PDF:\n\n{result['pdf']}")
-
             else:
-                st.error("RTC download failed.")
+                st.warning(result.get("message", "No records or data exist."))
+
+                if result.get("portal_message"):
+                    st.write(result.get("portal_message"))
+
                 st.write(result)
 
         except Exception as e:
