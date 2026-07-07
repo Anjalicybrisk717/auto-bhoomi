@@ -1,8 +1,10 @@
 import json
+import os
 from playwright.sync_api import sync_playwright
 
 AKARBAND_URL = "https://bhoomojini.karnataka.gov.in/service39/"
-OUTPUT_FILE = "akarband-master.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(BASE_DIR, "akarband-master.json")
 
 
 def clean_options(options):

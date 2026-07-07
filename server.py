@@ -7,6 +7,7 @@ import uvicorn
 import unicodedata
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 BHOOMI_URL = "https://landrecords.karnataka.gov.in/Service2/"
@@ -86,12 +87,12 @@ def normalize_text(text: str) -> str:
 
     return text.strip().lower()
 
-def select_dropdown_by_text_contains(page, index, wanted_text):
+def select_dropdown_by_text_contains(page, index, wanted_text, allow_partial=True):
     wanted = normalize_text(wanted_text)
 
     result = page.evaluate(
         """
-        ({index, wanted}) => {
+        ({index, wanted, allowPartial}) => {
 
             function normalize(s){
                 if(!s) return "";
@@ -128,14 +129,9 @@ def select_dropdown_by_text_contains(page, index, wanted_text):
             const options=Array.from(ddl.options);
 
             for(const option of options){
-
                 const txt=normalize(option.textContent);
 
-                if(
-                    txt===wanted ||
-                    txt.includes(wanted) ||
-                    wanted.includes(txt)
-                ){
+                if(txt===wanted){
 
                     ddl.value=option.value;
 
@@ -146,6 +142,29 @@ def select_dropdown_by_text_contains(page, index, wanted_text):
                         success:true,
                         selected:option.textContent.trim()
                     };
+                }
+            }
+
+            if(allowPartial && !/^\\d+$/.test(wanted)){
+                for(const option of options){
+                    const txt=normalize(option.textContent);
+
+                    if(!txt || /^\\d+$/.test(txt)){
+                        continue;
+                    }
+
+                    if(txt.includes(wanted) || wanted.includes(txt)){
+
+                        ddl.value=option.value;
+
+                        ddl.dispatchEvent(new Event("input",{bubbles:true}));
+                        ddl.dispatchEvent(new Event("change",{bubbles:true}));
+
+                        return{
+                            success:true,
+                            selected:option.textContent.trim()
+                        };
+                    }
                 }
             }
 
@@ -160,6 +179,7 @@ def select_dropdown_by_text_contains(page, index, wanted_text):
         {
             "index": index,
             "wanted": wanted,
+            "allowPartial": allow_partial,
         },
     )
 
@@ -673,6 +693,110 @@ def fill_revenue_map_fields(page, data):
         page.wait_for_timeout(1500)
 
 
+def get_revenue_map_file_element(page, village_name, cell_index):
+    handle = page.evaluate_handle(
+        """
+        ({villageName, cellIndex}) => {
+            const normalize = (value) =>
+                (value || "").trim().toLowerCase().replace(/\\s+/g, " ");
+
+            const wanted = normalize(villageName);
+            const rows = Array.from(document.querySelectorAll("tr"));
+
+            for (const row of rows) {
+                const cells = Array.from(row.querySelectorAll("td"));
+
+                if (cells.length <= cellIndex) continue;
+
+                const village = normalize(cells[3].innerText);
+
+                if (village !== wanted) continue;
+
+                const cell = cells[cellIndex];
+                return (
+                    cell.querySelector("a") ||
+                    cell.querySelector("input[type='image']") ||
+                    cell.querySelector("input[type='button']") ||
+                    cell.querySelector("button") ||
+                    cell.querySelector("img") ||
+                    cell
+                );
+            }
+
+            return null;
+        }
+        """,
+        {
+            "villageName": village_name,
+            "cellIndex": cell_index,
+        },
+    )
+
+    return handle.as_element()
+
+
+def save_revenue_map_result_page(context, result_page, download_path):
+    result_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    result_page.wait_for_timeout(2000)
+
+    result_url = result_page.url
+
+    if result_url and result_url.startswith("http"):
+        response = context.request.get(result_url)
+        body = response.body()
+        content_type = response.headers.get("content-type", "").lower()
+
+        if response.ok and ("pdf" in content_type or body.startswith(b"%PDF")):
+            with open(download_path, "wb") as f:
+                f.write(body)
+            return result_url
+
+    result_page.pdf(
+        path=download_path,
+        format="A4",
+        print_background=True,
+    )
+    return result_url
+
+
+def click_and_save_revenue_map_pdf(context, page, pdf_element, download_path):
+    pages_before_click = list(context.pages)
+
+    try:
+        with page.expect_download(timeout=10000) as download_info:
+            pdf_element.click(force=True)
+
+        download = download_info.value
+        download.save_as(download_path)
+        return download.url
+
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(3000)
+
+        new_pages = [
+            open_page
+            for open_page in context.pages
+            if open_page not in pages_before_click
+        ]
+
+        if new_pages:
+            return save_revenue_map_result_page(context, new_pages[-1], download_path)
+
+        if page.url != REVENUE_MAP_URL:
+            return save_revenue_map_result_page(context, page, download_path)
+
+        embedded_pdf_count = page.locator("embed, iframe, object").count()
+
+        if embedded_pdf_count:
+            return save_revenue_map_result_page(context, page, download_path)
+
+        with context.expect_page(timeout=10000) as new_page_info:
+            pdf_element.click(force=True)
+
+        result_page = new_page_info.value
+        return save_revenue_map_result_page(context, result_page, download_path)
+
+
 def fetch_revenue_map(data):
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -715,99 +839,39 @@ def fetch_revenue_map(data):
                 f"{safe_filename(data['village'])}"
             )
 
-            file_info = page.evaluate(
-                """
-                (villageName) => {
-                    const wanted = villageName.trim().toLowerCase();
-                    const rows = Array.from(document.querySelectorAll("tr"));
-
-                    for (const row of rows) {
-                        const cells = Array.from(row.querySelectorAll("td"));
-
-                        if (cells.length < 6) continue;
-
-                        const village = cells[3].innerText.trim().toLowerCase();
-
-                        if (village !== wanted) continue;
-
-                        function extract(cell) {
-                            const link = cell.querySelector("a");
-
-                            if (link && link.href) {
-                                return link.href;
-                            }
-
-                            const img = cell.querySelector("img");
-
-                            if (img) {
-                                const parent = img.closest("a");
-
-                                if (parent && parent.href) {
-                                    return parent.href;
-                                }
-                            }
-
-                            return null;
-                        }
-
-                        const pdfUrl = extract(cells[4]);
-
-                        if (pdfUrl) {
-                            return {
-                                fileType: "pdf",
-                                url: pdfUrl
-                            };
-                        }
-
-                        const kmzUrl = extract(cells[5]);
-
-                        if (kmzUrl) {
-                            return {
-                                fileType: "kmz",
-                                url: kmzUrl
-                            };
-                        }
-
-                        return null;
-                    }
-
-                    return null;
-                }
-                """,
+            pdf_element = get_revenue_map_file_element(
+                page,
                 data["village"],
+                4,
             )
 
-            if not file_info:
+            if not pdf_element:
                 page.screenshot(
-                    path="revenue-map-no-download-file.png",
+                    path="revenue-map-no-pdf-icon.png",
                     full_page=True,
                 )
-                raise Exception("No PDF or KMZ file available for selected village.")
-
-            file_type = file_info["fileType"]
-            file_url = file_info["url"]
+                raise Exception("No PDF file icon available for selected village.")
 
             download_path = os.path.join(
                 "revenue_maps",
-                f"{base_name}.{file_type}",
+                f"{base_name}.pdf",
             )
 
-            response = context.request.get(file_url)
-
-            if not response.ok:
-                raise Exception(f"Failed to download {file_type.upper()} file")
-
-            with open(download_path, "wb") as f:
-                f.write(response.body())
+            source_url = click_and_save_revenue_map_pdf(
+                context,
+                page,
+                pdf_element,
+                download_path,
+            )
 
             return {
                 "success": True,
                 "type": "REVENUE_MAP",
-                "file_type": file_type.upper(),
+                "file_type": "PDF",
                 "file": download_path,
-                "pdf": download_path if file_type == "pdf" else None,
-                "kmz": download_path if file_type == "kmz" else None,
-                "source_url": file_url,
+                "pdf": download_path,
+                "kmz": None,
+                "source_url": source_url,
             }
 
         except Exception as e:
@@ -1188,13 +1252,28 @@ def fetch_akarband(data):
             select_dropdown_by_text_contains(page, 3, data["village"])
             page.wait_for_timeout(2000)
 
-            select_dropdown_by_text_contains(page, 4, data["surveyNumber"])
+            select_dropdown_by_text_contains(
+                page,
+                4,
+                data["surveyNumber"],
+                allow_partial=False,
+            )
             page.wait_for_timeout(2000)
 
-            select_dropdown_by_text_contains(page, 5, data.get("surnoc", "*"))
+            select_dropdown_by_text_contains(
+                page,
+                5,
+                data.get("surnoc", "*"),
+                allow_partial=False,
+            )
             page.wait_for_timeout(2000)
 
-            select_dropdown_by_text_contains(page, 6, data.get("hissa", "*"))
+            select_dropdown_by_text_contains(
+                page,
+                6,
+                data.get("hissa", "*"),
+                allow_partial=False,
+            )
             page.wait_for_timeout(2000)
 
             os.makedirs("akarband_downloads", exist_ok=True)
@@ -1220,26 +1299,12 @@ def fetch_akarband(data):
                     button.click(force=True)
 
                 result_page = popup_info.value
-                result_page.wait_for_load_state("domcontentloaded", timeout=60000)
-                result_page.wait_for_timeout(7000)
 
-                result_page.pdf(
-                    path=pdf_path,
-                    format="A4",
-                    landscape=True,
-                    print_background=True,
-                )
-
-            except Exception:
+            except PlaywrightTimeoutError:
                 button.click(force=True)
-                page.wait_for_timeout(7000)
+                result_page = page
 
-                page.pdf(
-                    path=pdf_path,
-                    format="A4",
-                    landscape=True,
-                    print_background=True,
-                )
+            save_akarband_pdf_from_viewer(context, result_page, pdf_path)
 
             return {
                 "success": True,
@@ -1253,6 +1318,289 @@ def fetch_akarband(data):
 
         finally:
             browser.close()
+
+
+def click_pdf_viewer_download_button(page):
+    return page.evaluate(
+        """
+        () => {
+            function visible(el) {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+
+            function clickIfPresent(root, selectors) {
+                if (!root) return false;
+
+                for (const selector of selectors) {
+                    const el = root.querySelector(selector);
+
+                    if (visible(el)) {
+                        el.click();
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            function allRoots(root) {
+                const roots = [root];
+                const walker = document.createTreeWalker(
+                    root,
+                    NodeFilter.SHOW_ELEMENT
+                );
+
+                while (walker.nextNode()) {
+                    const el = walker.currentNode;
+
+                    if (el.shadowRoot) {
+                        roots.push(...allRoots(el.shadowRoot));
+                    }
+                }
+
+                return roots;
+            }
+
+            function textOf(el) {
+                return [
+                    el.id,
+                    el.className,
+                    el.getAttribute("title"),
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("data-l10n-id"),
+                    el.textContent,
+                    el.innerText,
+                    el.innerHTML
+                ]
+                    .filter(Boolean)
+                    .join(" ")
+                    .toLowerCase();
+            }
+
+            function clickSemanticDownload(root) {
+                const elements = Array.from(
+                    root.querySelectorAll("button, a, input, cr-icon-button, mwc-icon-button, [role='button']")
+                );
+
+                for (const el of elements) {
+                    if (!visible(el)) continue;
+
+                    const text = textOf(el);
+
+                    if (
+                        text.includes("download") ||
+                        text.includes("file_download") ||
+                        text.includes("save")
+                    ) {
+                        el.click();
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            const selectors = [
+                '#download',
+                '#downloadButton',
+                '#download-button',
+                '#save',
+                'cr-icon-button#download',
+                'cr-icon-button#save',
+                'button#download',
+                'button#downloadButton',
+                'button#download-button',
+                'button[data-l10n-id="download"]',
+                '[data-l10n-id="download"]',
+                'button[aria-label*="Save"]',
+                'button[aria-label*="Download"]',
+                'button[title*="Save"]',
+                'button[title*="Download"]',
+                '[title*="Save"]',
+                '[title*="Download"]',
+                '[aria-label*="Save"]',
+                '[aria-label*="Download"]'
+            ];
+
+            for (const root of allRoots(document)) {
+                if (clickIfPresent(root, selectors)) return true;
+                if (clickSemanticDownload(root)) return true;
+            }
+
+            const visibleButtons = Array.from(
+                document.querySelectorAll("button, a, [role='button']")
+            ).filter(visible);
+
+            visibleButtons.sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return br.right - ar.right || ar.top - br.top;
+            });
+
+            for (const button of visibleButtons) {
+                const rect = button.getBoundingClientRect();
+
+                if (rect.top < 120 && rect.right > window.innerWidth - 180) {
+                    const text = textOf(button);
+
+                    if (!text.includes("print") && !text.includes("settings")) {
+                        button.click();
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+        """
+    )
+
+
+def is_pdf_file(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except Exception:
+        return False
+
+
+def save_pdf_bytes_from_viewer_source(context, result_page, pdf_path):
+    source = result_page.evaluate(
+        """
+        async () => {
+            function allRoots(root) {
+                const roots = [root];
+                const walker = document.createTreeWalker(
+                    root,
+                    NodeFilter.SHOW_ELEMENT
+                );
+
+                while (walker.nextNode()) {
+                    const el = walker.currentNode;
+
+                    if (el.shadowRoot) {
+                        roots.push(...allRoots(el.shadowRoot));
+                    }
+                }
+
+                return roots;
+            }
+
+            const urls = new Set([window.location.href]);
+
+            for (const root of allRoots(document)) {
+                for (const el of root.querySelectorAll("embed, iframe, object")) {
+                    const url = el.src || el.data;
+
+                    if (url) {
+                        urls.add(url);
+                    }
+                }
+
+                for (const el of root.querySelectorAll("[src], [href], [data]")) {
+                    const url = el.src || el.href || el.data;
+
+                    if (url && /pdf|blob:|data:application\\/pdf/i.test(url)) {
+                        urls.add(url);
+                    }
+                }
+            }
+
+            for (const url of urls) {
+                if (!url || url === "about:blank") continue;
+
+                if (url.startsWith("data:application/pdf")) {
+                    return {
+                        kind: "data",
+                        url
+                    };
+                }
+
+                if (url.startsWith("blob:")) {
+                    const response = await fetch(url);
+                    const buffer = await response.arrayBuffer();
+                    let binary = "";
+                    const bytes = new Uint8Array(buffer);
+
+                    for (let i = 0; i < bytes.length; i += 1) {
+                        binary += String.fromCharCode(bytes[i]);
+                    }
+
+                    return {
+                        kind: "base64",
+                        body: btoa(binary),
+                        url
+                    };
+                }
+
+                if (/pdf/i.test(url)) {
+                    return {
+                        kind: "url",
+                        url
+                    };
+                }
+            }
+
+            return null;
+        }
+        """
+    )
+
+    if not source:
+        return False
+
+    if source["kind"] == "base64":
+        with open(pdf_path, "wb") as f:
+            f.write(base64.b64decode(source["body"]))
+        return is_pdf_file(pdf_path)
+
+    if source["kind"] == "data":
+        header, encoded = source["url"].split(",", 1)
+        data = base64.b64decode(encoded) if ";base64" in header else encoded.encode()
+        with open(pdf_path, "wb") as f:
+            f.write(data)
+        return is_pdf_file(pdf_path)
+
+    response = context.request.get(source["url"])
+
+    if response.ok:
+        body = response.body()
+
+        if body.startswith(b"%PDF"):
+            with open(pdf_path, "wb") as f:
+                f.write(body)
+            return True
+
+    return False
+
+
+def save_akarband_pdf_from_viewer(context, result_page, pdf_path):
+    result_page.wait_for_load_state("domcontentloaded", timeout=60000)
+    result_page.wait_for_timeout(7000)
+
+    try:
+        with result_page.expect_download(timeout=15000) as download_info:
+            clicked = click_pdf_viewer_download_button(result_page)
+
+            if not clicked:
+                viewport = result_page.viewport_size or {"width": 1280, "height": 720}
+                result_page.mouse.click(viewport["width"] - 105, 70)
+
+        download = download_info.value
+        download.save_as(pdf_path)
+        if is_pdf_file(pdf_path):
+            return
+
+    except Exception:
+        pass
+
+    if save_pdf_bytes_from_viewer_source(context, result_page, pdf_path):
+        return
+
+    raise Exception("Could not save the original Akarband PDF from the viewer")
+
 
 def get_node_portal_value(node, fallback):
     if isinstance(node, dict):
