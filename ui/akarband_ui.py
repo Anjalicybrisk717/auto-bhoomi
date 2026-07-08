@@ -3,7 +3,6 @@ import os
 import streamlit as st
 import requests
 
-
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AKARBAND_MASTER_PATH = os.path.join(BASE_DIR, "akarband-master.json")
 
@@ -31,19 +30,63 @@ def get_dropdown_options(node):
     return []
 
 
+def rerun_app():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+def reset_akarband_portal_options():
+    for key in (
+        "Akarband_portal_options",
+        "Akarband_portal_criteria",
+        "Akarband_surnoc",
+        "Akarband_hissa",
+    ):
+        st.session_state.pop(key, None)
+
+
+def reset_akarband_survey():
+    st.session_state.pop("Akarband_survey", None)
+    reset_akarband_portal_options()
+
+
 def reset_akarband_taluk():
     st.session_state.pop("Akarband_taluk", None)
     st.session_state.pop("Akarband_hobli", None)
     st.session_state.pop("Akarband_village", None)
+    reset_akarband_survey()
 
 
 def reset_akarband_hobli():
     st.session_state.pop("Akarband_hobli", None)
     st.session_state.pop("Akarband_village", None)
+    reset_akarband_survey()
 
 
 def reset_akarband_village():
     st.session_state.pop("Akarband_village", None)
+    reset_akarband_survey()
+
+
+def option_labels(options):
+    return [option["label"] for option in options if option.get("label")]
+
+
+def fetch_akarband_options(api_base, payload):
+    response = requests.post(
+        f"{api_base}/api/akarband/options",
+        json=payload,
+        timeout=240,
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("success"):
+        raise Exception(result)
+
+    return result
 
 
 def render_akarband_ui(api_base, master, districts, headless):
@@ -85,7 +128,9 @@ def render_akarband_ui(api_base, master, districts, headless):
         )
 
     with col2:
-        taluks = list(akarband_master[district].keys()) if district != "--ಆಯ್ಕೆ--" else []
+        taluks = (
+            list(akarband_master[district].keys()) if district != "--ಆಯ್ಕೆ--" else []
+        )
 
         taluk = st.selectbox(
             "ತಾಲೂಕು:",
@@ -113,11 +158,7 @@ def render_akarband_ui(api_base, master, districts, headless):
     col4, col5, col6 = st.columns(3)
 
     with col4:
-        if (
-            district != "--ಆಯ್ಕೆ--"
-            and taluk != "--ಆಯ್ಕೆ--"
-            and hobli != "--ಆಯ್ಕೆ--"
-        ):
+        if district != "--ಆಯ್ಕೆ--" and taluk != "--ಆಯ್ಕೆ--" and hobli != "--ಆಯ್ಕೆ--":
             villages = get_dropdown_options(akarband_master[district][taluk][hobli])
         else:
             villages = []
@@ -127,29 +168,112 @@ def render_akarband_ui(api_base, master, districts, headless):
             ["--ಆಯ್ಕೆ--"] + villages,
             disabled=hobli == "--ಆಯ್ಕೆ--",
             key="Akarband_village",
+            on_change=reset_akarband_survey,
         )
+
+    location_ready = (
+        district != "--ಆಯ್ಕೆ--"
+        and taluk != "--ಆಯ್ಕೆ--"
+        and hobli != "--ಆಯ್ಕೆ--"
+        and village != "--ಆಯ್ಕೆ--"
+    )
+
+    location_criteria = {
+        "district": district,
+        "taluk": taluk,
+        "hobli": hobli,
+        "village": village,
+    }
+
+    if st.session_state.get("Akarband_location_criteria") != location_criteria:
+        st.session_state["Akarband_location_criteria"] = location_criteria
+        reset_akarband_portal_options()
 
     with col5:
         survey_number = st.text_input(
             "ಸರ್ವೆ ಸಂಖ್ಯೆ:",
+            disabled=not location_ready,
             key="Akarband_survey",
-        )
+        ).strip()
+
+    if False:
+        if surnoc_options:
+            surnoc = st.selectbox(
+                "ಸನೋರ್ಕ್:",
+                surnoc_options,
+                key="Akarband_surnoc",
+            )
+        else:
+            surnoc = ""
+            st.selectbox(
+                "ಸನೋರ್ಕ್:",
+                ["--ಆಯ್ಕೆ--"],
+                disabled=True,
+                key="Akarband_surnoc_disabled",
+            )
 
     with col6:
         surnoc = st.text_input(
-            "ಸನೋರ್ಕ್:",
-            value="*",
+            "Surnoc:",
+            disabled=not (location_ready and survey_number),
             key="Akarband_surnoc",
-        )
+        ).strip()
+
+    if False:
+        surnoc_criteria = {
+            "location": location_criteria,
+            "surveyNumber": survey_number,
+            "surnoc": surnoc,
+        }
+
+        if st.session_state.get("Akarband_portal_criteria") != surnoc_criteria:
+            try:
+                with st.spinner("Loading Hissa from Akarband portal..."):
+                    st.session_state.pop("Akarband_hissa", None)
+                    st.session_state["Akarband_portal_options"] = (
+                        fetch_akarband_options(
+                            api_base,
+                            {
+                                **location_criteria,
+                                "surveyNumber": survey_number,
+                                "surnoc": surnoc,
+                                "hissa": "",
+                                "headless": headless,
+                            },
+                        )
+                    )
+                    st.session_state["Akarband_portal_criteria"] = surnoc_criteria
+                rerun_app()
+            except Exception as error:
+                st.error(f"Unable to load Hissa options: {error}")
+
+        options_result = st.session_state.get("Akarband_portal_options") or {}
+        hissa_options = option_labels(options_result.get("hissas", []))
 
     col7, col8, col9 = st.columns(3)
 
+    if False:
+        if hissa_options:
+            hissa = st.selectbox(
+                "ಹಿಸ್ಸಾ:",
+                hissa_options,
+                key="Akarband_hissa",
+            )
+        else:
+            hissa = ""
+            st.selectbox(
+                "ಹಿಸ್ಸಾ:",
+                ["--ಆಯ್ಕೆ--"],
+                disabled=True,
+                key="Akarband_hissa_disabled",
+            )
+
     with col7:
         hissa = st.text_input(
-            "ಹಿಸ್ಸಾ:",
-            value="*",
+            "Hissa:",
+            disabled=not (location_ready and survey_number and surnoc),
             key="Akarband_hissa",
-        )
+        ).strip()
 
     with col8:
         st.write("")
@@ -158,13 +282,7 @@ def render_akarband_ui(api_base, master, districts, headless):
         st.write("")
         st.write("")
 
-        disabled = not (
-            district != "--ಆಯ್ಕೆ--"
-            and taluk != "--ಆಯ್ಕೆ--"
-            and hobli != "--ಆಯ್ಕೆ--"
-            and village != "--ಆಯ್ಕೆ--"
-            and survey_number.strip()
-        )
+        disabled = not (location_ready and survey_number and surnoc and hissa)
 
         clicked = st.button(
             "ಆಕಾರಬಂದ್ ಪಡೆಯಿರಿ",
@@ -178,9 +296,9 @@ def render_akarband_ui(api_base, master, districts, headless):
             "taluk": taluk,
             "hobli": hobli,
             "village": village,
-            "surveyNumber": survey_number.strip(),
-            "surnoc": surnoc.strip() or "*",
-            "hissa": hissa.strip() or "*",
+            "surveyNumber": survey_number,
+            "surnoc": surnoc,
+            "hissa": hissa,
             "headless": headless,
         }
 

@@ -32,17 +32,6 @@ def render_rtc_ui(api_base, master, districts, headless):
             if result.get("success"):
                 st.success("RTC downloaded successfully.")
 
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    st.metric("Surnoc", result.get("selected_surnoc", "-"))
-
-                with col2:
-                    st.metric("Hissa", result.get("selected_hissa", "-"))
-
-                with col3:
-                    st.metric("Period", result.get("selected_period", "-"))
-
                 if result.get("pdf"):
                     st.info(f"Saved PDF:\n\n{result['pdf']}")
             else:

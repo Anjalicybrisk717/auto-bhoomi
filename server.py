@@ -65,7 +65,11 @@ class AkarbandRequest(BaseModel):
     surnoc: str = ""
     hissa: str = ""
     headless: bool = False
-    
+
+
+class AkarbandOptionsRequest(AkarbandRequest):
+    surveyNumber: str = ""
+
 
 def safe_filename(value):
     return (
@@ -77,6 +81,7 @@ def safe_filename(value):
         .replace(")", "")
     )
 
+
 def normalize_text(text: str) -> str:
     if text is None:
         return ""
@@ -86,6 +91,7 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
 
     return text.strip().lower()
+
 
 def select_dropdown_by_text_contains(page, index, wanted_text, allow_partial=True):
     wanted = normalize_text(wanted_text)
@@ -187,6 +193,8 @@ def select_dropdown_by_text_contains(page, index, wanted_text, allow_partial=Tru
         raise Exception(result)
 
     page.wait_for_timeout(2000)
+    return result.get("selected")
+
 
 def click_button_by_text(page, button_text):
     clicked = page.evaluate(
@@ -227,6 +235,139 @@ def click_fetch_details(page):
     click_button_by_text(page, "Fetch Details")
 
 
+def require_filled_fields(data, fields, context):
+    missing = [
+        field
+        for field in fields
+        if not str(data.get(field, "")).strip()
+    ]
+
+    if missing:
+        raise Exception(f"{context} requires: {', '.join(missing)}")
+
+
+def wait_for_visible_select_ready(page, index, min_options=1):
+    page.wait_for_function(
+        """
+        ({index, minOptions}) => {
+            const selects = Array.from(document.querySelectorAll("select"))
+                .filter(s => {
+                    const r = s.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !s.disabled;
+                });
+
+            const ddl = selects[index];
+            return !!ddl && ddl.options.length >= minOptions;
+        }
+        """,
+        arg={"index": index, "minOptions": min_options},
+        timeout=30000,
+    )
+
+
+def wait_for_visible_select_filled(page, index, field_name):
+    filled = page.wait_for_function(
+        """
+        (index) => {
+            const selects = Array.from(document.querySelectorAll("select"))
+                .filter(s => {
+                    const r = s.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !s.disabled;
+                });
+
+            const ddl = selects[index];
+            if (!ddl) return false;
+
+            const selected = ddl.options[ddl.selectedIndex];
+            const text = (selected ? selected.textContent : "")
+                .normalize("NFKC")
+                .replace(/\\u00a0/g, " ")
+                .replace(/\\s+/g, " ")
+                .trim()
+                .toLowerCase();
+
+            if (!ddl.value && !text) return false;
+
+            return (
+                text &&
+                !text.includes("select") &&
+                !text.startsWith("--")
+            );
+        }
+        """,
+        arg=index,
+        timeout=30000,
+    )
+
+    if not filled:
+        raise Exception(f"{field_name} was not filled")
+
+
+def select_cascading_dropdown(
+    page,
+    index,
+    value,
+    field_name,
+    next_index=None,
+    allow_partial=True,
+):
+    wait_for_visible_select_ready(page, index, min_options=2)
+    selected = select_dropdown_by_text_contains(
+        page,
+        index,
+        value,
+        allow_partial=allow_partial,
+    )
+    wait_for_visible_select_filled(page, index, field_name)
+
+    if next_index is not None:
+        wait_for_visible_select_ready(page, next_index, min_options=2)
+
+    return selected
+
+
+def click_akarband_fetch_button(page):
+    clicked = page.evaluate(
+        """
+        () => {
+            function visible(el) {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+
+            const items = Array.from(document.querySelectorAll("button, input, a"))
+                .filter(el => visible(el) && !el.disabled);
+
+            const btn = items.find(el => {
+                const text = (el.innerText || el.value || "")
+                    .normalize("NFKC")
+                    .replace(/\\u00a0/g, " ")
+                    .replace(/\\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+                return (
+                    text === "fetch" ||
+                    text === "fetch details" ||
+                    text.includes("fetch details") ||
+                    text.includes("fetch")
+                );
+            });
+
+            if (!btn) return false;
+
+            btn.click();
+            return true;
+        }
+        """
+    )
+
+    if not clicked:
+        raise Exception("Akarband Fetch button not found")
+
+    page.wait_for_timeout(8000)
+
+
 def fill_rtc_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
 
@@ -249,15 +390,13 @@ def fill_rtc_fields(page, data):
     survey_input.wait_for(state="visible", timeout=30000)
     survey_input.fill(str(data["surveyNumber"]))
 
-    survey_input.evaluate(
-        """
+    survey_input.evaluate("""
         (el) => {
             el.dispatchEvent(new Event("input", { bubbles: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
             el.dispatchEvent(new Event("blur", { bubbles: true }));
         }
-        """
-    )
+        """)
 
     page.wait_for_timeout(1000)
 
@@ -269,6 +408,7 @@ def fill_rtc_fields(page, data):
     go_btn.click(force=True)
 
     page.wait_for_timeout(8000)
+
 
 def fill_mr_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
@@ -323,6 +463,57 @@ def select_first_option_by_index(page, index):
             return text
 
     return None
+
+
+def get_visible_select_options(page, index, include_placeholder=False):
+    result = page.evaluate(
+        """
+        ({index, includePlaceholder}) => {
+            const selects = Array.from(document.querySelectorAll("select"))
+                .filter(s => {
+                    const r = s.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !s.disabled;
+                });
+
+            const ddl = selects[index];
+
+            if (!ddl) {
+                return {
+                    success: false,
+                    reason: "Dropdown not found",
+                    count: selects.length
+                };
+            }
+
+            const options = Array.from(ddl.options)
+                .map(option => ({
+                    label: (option.textContent || "").trim(),
+                    value: option.value
+                }))
+                .filter(option => {
+                    if (!option.label) return false;
+                    if (includePlaceholder) return true;
+                    const label = option.label.toLowerCase();
+                    return (
+                        !label.includes("select") &&
+                        !option.label.includes("ಆಯ್ಕೆ") &&
+                        !option.label.startsWith("--")
+                    );
+                });
+
+            return {
+                success: true,
+                options
+            };
+        }
+        """,
+        {"index": index, "includePlaceholder": include_placeholder},
+    )
+
+    if not result.get("success"):
+        raise Exception(result)
+
+    return result.get("options", [])
 
 
 def save_page_screenshot_as_pdf(browser, source_page, pdf_path):
@@ -405,8 +596,7 @@ def save_rtc_pdf(page, data):
 
     page.wait_for_timeout(3000)
 
-    view_clicked = page.evaluate(
-        """
+    view_clicked = page.evaluate("""
         () => {
             const items = Array.from(document.querySelectorAll("input, button, a"));
 
@@ -425,8 +615,7 @@ def save_rtc_pdf(page, data):
             btn.click();
             return true;
         }
-        """
-    )
+        """)
 
     if not view_clicked:
         page.screenshot(path="rtc-view-button-not-found.png", full_page=True)
@@ -509,6 +698,7 @@ def fetch_rtc_with_playwright(data):
 
         finally:
             browser.close()
+
 
 def extract_mutation_rows(page):
     return page.evaluate("""
@@ -1115,8 +1305,7 @@ def fetch_survey_sketch(data):
 
             select_dropdown(5, data.get("hissa", "*"))
 
-            search_clicked = page.evaluate(
-                """
+            search_clicked = page.evaluate("""
                 () => {
                     const items = Array.from(document.querySelectorAll("button, input, a"));
 
@@ -1132,16 +1321,14 @@ def fetch_survey_sketch(data):
                     btn.click();
                     return true;
                 }
-                """
-            )
+                """)
 
             if not search_clicked:
                 raise Exception("Search button not found")
 
             page.wait_for_timeout(10000)
 
-            view_clicked = page.evaluate(
-                """
+            view_clicked = page.evaluate("""
                 () => {
                     const items = Array.from(document.querySelectorAll("button, input, a, span, div"));
 
@@ -1157,8 +1344,7 @@ def fetch_survey_sketch(data):
                     btn.click();
                     return true;
                 }
-                """
-            )
+                """)
 
             if not view_clicked:
                 raise Exception("View Sketch On Map button not found")
@@ -1216,7 +1402,22 @@ def fetch_survey_sketch(data):
         finally:
             browser.close()
 
+
 def fetch_akarband(data):
+    require_filled_fields(
+        data,
+        [
+            "district",
+            "taluk",
+            "hobli",
+            "village",
+            "surveyNumber",
+            "surnoc",
+            "hissa",
+        ],
+        "Akarband fetch",
+    )
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=data.get("headless", False),
@@ -1240,41 +1441,57 @@ def fetch_akarband(data):
 
             page.wait_for_selector("select", timeout=30000)
 
-            select_dropdown_by_text_contains(page, 0, data["district"])
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(page, 1, data["taluk"])
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(page, 2, data["hobli"])
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(page, 3, data["village"])
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(
+            selected_district = select_cascading_dropdown(
+                page,
+                0,
+                data["district"],
+                "District",
+                next_index=1,
+            )
+            selected_taluk = select_cascading_dropdown(
+                page,
+                1,
+                data["taluk"],
+                "Taluk",
+                next_index=2,
+            )
+            selected_hobli = select_cascading_dropdown(
+                page,
+                2,
+                data["hobli"],
+                "Hobli",
+                next_index=3,
+            )
+            selected_village = select_cascading_dropdown(
+                page,
+                3,
+                data["village"],
+                "Village",
+                next_index=4,
+            )
+            selected_survey = select_cascading_dropdown(
                 page,
                 4,
                 data["surveyNumber"],
+                "Survey No",
+                next_index=5,
                 allow_partial=False,
             )
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(
+            selected_surnoc = select_cascading_dropdown(
                 page,
                 5,
-                data.get("surnoc", "*"),
+                data["surnoc"],
+                "Surnoc",
+                next_index=6,
                 allow_partial=False,
             )
-            page.wait_for_timeout(2000)
-
-            select_dropdown_by_text_contains(
+            selected_hissa = select_cascading_dropdown(
                 page,
                 6,
-                data.get("hissa", "*"),
+                data["hissa"],
+                "Hissa",
                 allow_partial=False,
             )
-            page.wait_for_timeout(2000)
 
             os.makedirs("akarband_downloads", exist_ok=True)
 
@@ -1309,6 +1526,13 @@ def fetch_akarband(data):
             return {
                 "success": True,
                 "type": "AKARBAND",
+                "selected_district": selected_district,
+                "selected_taluk": selected_taluk,
+                "selected_hobli": selected_hobli,
+                "selected_village": selected_village,
+                "selected_survey": selected_survey,
+                "selected_surnoc": selected_surnoc,
+                "selected_hissa": selected_hissa,
                 "pdf": pdf_path,
             }
 
@@ -1321,8 +1545,7 @@ def fetch_akarband(data):
 
 
 def click_pdf_viewer_download_button(page):
-    return page.evaluate(
-        """
+    return page.evaluate("""
         () => {
             function visible(el) {
                 if (!el) return false;
@@ -1454,8 +1677,7 @@ def click_pdf_viewer_download_button(page):
 
             return false;
         }
-        """
-    )
+        """)
 
 
 def is_pdf_file(path):
@@ -1467,8 +1689,7 @@ def is_pdf_file(path):
 
 
 def save_pdf_bytes_from_viewer_source(context, result_page, pdf_path):
-    source = result_page.evaluate(
-        """
+    source = result_page.evaluate("""
         async () => {
             function allRoots(root) {
                 const roots = [root];
@@ -1545,8 +1766,7 @@ def save_pdf_bytes_from_viewer_source(context, result_page, pdf_path):
 
             return null;
         }
-        """
-    )
+        """)
 
     if not source:
         return False
@@ -1639,6 +1859,101 @@ def get_portal_location_values(data):
     return district_value, taluk_value, hobli_value, village_value
 
 
+def fetch_akarband_options(data):
+    require_filled_fields(
+        data,
+        ["district", "taluk", "hobli", "village"],
+        "Akarband options",
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=data.get("headless", False),
+            slow_mo=300,
+            args=["--lang=kn-IN", "--disable-features=Translate"],
+        )
+
+        context = browser.new_context(locale="kn-IN")
+        page = context.new_page()
+
+        try:
+            page.goto(AKARBAND_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("select", timeout=30000)
+
+            select_cascading_dropdown(
+                page,
+                0,
+                data["district"],
+                "District",
+                next_index=1,
+            )
+            select_cascading_dropdown(
+                page,
+                1,
+                data["taluk"],
+                "Taluk",
+                next_index=2,
+            )
+            select_cascading_dropdown(
+                page,
+                2,
+                data["hobli"],
+                "Hobli",
+                next_index=3,
+            )
+            select_cascading_dropdown(
+                page,
+                3,
+                data["village"],
+                "Village",
+                next_index=4,
+            )
+
+            surveys = get_visible_select_options(page, 4)
+            surnocs = []
+            hissas = []
+            selected_survey = ""
+            selected_surnoc = ""
+
+            if data.get("surveyNumber", "").strip():
+                selected_survey = select_cascading_dropdown(
+                    page,
+                    4,
+                    data["surveyNumber"],
+                    "Survey No",
+                    next_index=5,
+                    allow_partial=False,
+                )
+                surnocs = get_visible_select_options(page, 5)
+
+            if data.get("surnoc", "").strip() and surnocs:
+                selected_surnoc = select_cascading_dropdown(
+                    page,
+                    5,
+                    data["surnoc"],
+                    "Surnoc",
+                    next_index=6,
+                    allow_partial=False,
+                )
+                hissas = get_visible_select_options(page, 6)
+
+            return {
+                "success": True,
+                "surveys": surveys,
+                "surnocs": surnocs,
+                "hissas": hissas,
+                "selected_survey": selected_survey,
+                "selected_surnoc": selected_surnoc,
+            }
+
+        except Exception as error:
+            page.screenshot(path="akarband-options-error.png", full_page=True)
+            raise Exception(f"Akarband options failed: {str(error)}")
+
+        finally:
+            browser.close()
+
+
 @app.post("/api/fetch-rtc/auto")
 def fetch_rtc_auto(data: BhoomiRequest):
     try:
@@ -1685,7 +2000,16 @@ def akarband_fetch(data: AkarbandRequest):
         return fetch_akarband(data.model_dump())
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
-    
+
+
+@app.post("/api/akarband/options")
+def akarband_options(data: AkarbandOptionsRequest):
+    try:
+        return fetch_akarband_options(data.model_dump())
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
 if __name__ == "__main__":
     uvicorn.run(
         app,
