@@ -5,6 +5,7 @@ from ui.rtc_ui import render_rtc_ui
 from ui.mr_ui import render_mr_ui
 from ui.revenue_map_ui import render_revenue_map_ui
 from ui.akarband_ui import render_akarband_ui
+from ui.rera_ui import render_rera_ui
 
 
 API_BASE = "http://localhost:5000"
@@ -114,7 +115,10 @@ with st.sidebar:
     st.header("Configuration")
 
     client_id = st.text_input("Client ID", value="default_client")
-    headless = st.checkbox("Headless Mode", value=True)
+    headless = st.checkbox(
+        "Headless Mode",
+        value=True,
+    )
 
     st.subheader("Download Location")
     st.markdown(
@@ -217,6 +221,14 @@ with tabs[0]:
 
         elif bhoomi_service != "Select Service":
             st.info(f"{bhoomi_service} automation will be added next.")
+
+    elif portal == "Karnataka RERA":
+        render_rera_ui(
+            API_BASE,
+            master,
+            districts,
+            headless,
+        )
 
     elif portal != "Select Portal":
         st.info(f"{portal} automation will be added next.")

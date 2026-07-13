@@ -1,21 +1,36 @@
-import os
+﻿import os
 import re
 import time
 import json
 import base64
-import uvicorn
 import unicodedata
+from html import escape
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+BASE_DIR = Path(__file__).resolve().parent
 BHOOMI_URL = "https://landrecords.karnataka.gov.in/Service2/"
 MR_URL = "https://landrecords.karnataka.gov.in/Service11/MR_MutationExtract.aspx"
 REVENUE_MAP_URL = "https://landrecords.karnataka.gov.in/service3/"
 SURVEY_SKETCH_URL = "https://rdservices.karnataka.gov.in/service84/"
 AKARBAND_URL = "https://bhoomojini.karnataka.gov.in/service39/"
+try:
+    BASE_DIR
+except NameError:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+RERA_URL = "https://rera.karnataka.gov.in/viewAllCompletedProjects"
+RERA_DOWNLOAD_DIR = os.path.join(BASE_DIR, "rera_downloads")
+RERA_PDF_DIR = RERA_DOWNLOAD_DIR
+os.makedirs(RERA_DOWNLOAD_DIR, exist_ok=True)
 with open("bhoomi-master-bilingual.json", "r", encoding="utf-8") as f:
     bilingual_master = json.load(f)
 
@@ -69,6 +84,36 @@ class AkarbandRequest(BaseModel):
 
 class AkarbandOptionsRequest(AkarbandRequest):
     surveyNumber: str = ""
+
+
+class ReraRequest(BaseModel):
+    action: str = "search"
+    searchType: str = ""
+    query: str = ""
+    registrationNumber: str = ""
+    projectName: str = ""
+    promoterName: str = ""
+    headless: bool = True
+    maxPages: int = 25
+    maxResults: int = 500
+
+
+ReraUnifiedRequest = ReraRequest
+
+
+class ReraSearchRequest(BaseModel):
+    searchType: str
+    query: str
+    headless: bool = True
+    maxPages: int = 25
+    maxResults: int = 500
+
+
+class ReraProjectPdfRequest(BaseModel):
+    registrationNumber: str = ""
+    projectName: str = ""
+    promoterName: str = ""
+    headless: bool = True
 
 
 def safe_filename(value):
@@ -368,6 +413,92 @@ def click_akarband_fetch_button(page):
     page.wait_for_timeout(8000)
 
 
+def find_akarband_fetch_button(page):
+    result = page.evaluate(
+        """
+        () => {
+            const clean = value => (value || "")
+                .normalize("NFKC")
+                .replace(/\\u00a0/g, " ")
+                .replace(/\\s+/g, " ")
+                .trim()
+                .toLowerCase();
+
+            const visible = element => {
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden";
+            };
+
+            const candidates = Array.from(
+                document.querySelectorAll(
+                    "button, input[type='button'], input[type='submit'], a"
+                )
+            ).filter(element => visible(element) && !element.disabled);
+
+            const scored = candidates.map((element, index) => {
+                const text = clean(
+                    element.innerText ||
+                    element.textContent ||
+                    element.value ||
+                    element.getAttribute("aria-label") ||
+                    ""
+                );
+                const classes = clean(element.className || "");
+                const type = clean(element.getAttribute("type") || "");
+                let score = 0;
+
+                if (text.includes("ಆಕಾರಬಂದ್")) score += 100;
+                if (text.includes("ಪಡೆಯಿರಿ") || text.includes("ಪಡೆ")) score += 80;
+                if (text.includes("akarband")) score += 100;
+                if (text.includes("fetch") || text.includes("submit")) score += 70;
+                if (type === "submit" || type === "button") score += 20;
+                if (classes.includes("btn") || classes.includes("button")) score += 10;
+
+                return {element, index, score, text};
+            }).filter(item => item.score > 0);
+
+            const selected = scored.sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return b.index - a.index;
+            })[0] || candidates[candidates.length - 1];
+
+            if (!selected) {
+                return {success: false, reason: "No visible enabled button found."};
+            }
+
+            const element = selected.element || selected;
+            document.querySelectorAll("[data-akarband-fetch-target]")
+                .forEach(item => item.removeAttribute("data-akarband-fetch-target"));
+            element.setAttribute("data-akarband-fetch-target", "true");
+            element.scrollIntoView({block: "center", inline: "center"});
+
+            return {
+                success: true,
+                text: clean(
+                    element.innerText ||
+                    element.textContent ||
+                    element.value ||
+                    ""
+                ),
+            };
+        }
+        """
+    )
+
+    if not result.get("success"):
+        raise Exception(
+            "Akarband Fetch button not found: "
+            f"{result.get('reason', 'unknown reason')}"
+        )
+
+    return page.locator("[data-akarband-fetch-target='true']").first
+
+
 def fill_rtc_fields(page, data):
     page.wait_for_selector("select", timeout=30000)
 
@@ -496,7 +627,7 @@ def get_visible_select_options(page, index, include_placeholder=False):
                     const label = option.label.toLowerCase();
                     return (
                         !label.includes("select") &&
-                        !option.label.includes("ಆಯ್ಕೆ") &&
+                        !option.label.includes("à²†à²¯à³à²•à³†") &&
                         !option.label.startsWith("--")
                     );
                 });
@@ -1503,12 +1634,7 @@ def fetch_akarband(data):
                 f"{safe_filename(data['surveyNumber'])}.pdf",
             )
 
-            button = page.locator(
-                'button:has-text("ಆಕಾರಬಂದ್"), '
-                'input[value*="ಆಕಾರಬಂದ್"], '
-                'a:has-text("ಆಕಾರಬಂದ್")'
-            ).first
-
+            button = find_akarband_fetch_button(page)
             button.wait_for(state="visible", timeout=30000)
 
             try:
@@ -1954,6 +2080,2541 @@ def fetch_akarband_options(data):
             browser.close()
 
 
+
+def rera_clean(value):
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    value = value.replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def rera_norm(value):
+    return rera_clean(value).lower()
+
+
+def rera_safe_name(value):
+    value = rera_clean(value)
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value)
+    value = re.sub(r"\s+", "_", value).strip("._")
+    return (value or "RERA_PROJECT")[:120]
+
+
+def create_rera_browser(playwright, *, headless, load_assets):
+    browser = playwright.chromium.launch(
+        headless=bool(headless),
+        slow_mo=80,
+        args=[
+            "--disable-features=Translate",
+            "--disable-translate",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+
+    context = browser.new_context(
+        locale="en-IN",
+        viewport={"width": 1800, "height": 1100},
+        accept_downloads=True,
+        ignore_https_errors=True,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+    )
+
+    if not load_assets:
+        def route_handler(route):
+            if route.request.resource_type in {"image", "media", "font"}:
+                route.abort()
+            else:
+                route.continue_()
+
+        context.route("**/*", route_handler)
+
+    context.add_init_script(
+        """
+        (() => {
+            window.__reraPrintRequested = false;
+            window.__reraCloseRequested = false;
+            try {
+                Object.defineProperty(window, "print", {
+                    configurable: true,
+                    writable: true,
+                    value: () => {
+                        window.__reraPrintRequested = true;
+                    }
+                });
+            } catch (_) {
+                window.print = () => {
+                    window.__reraPrintRequested = true;
+                };
+            }
+
+            try {
+                Object.defineProperty(window, "close", {
+                    configurable: true,
+                    writable: true,
+                    value: () => {
+                        window.__reraCloseRequested = true;
+                    }
+                });
+            } catch (_) {
+                window.close = () => {
+                    window.__reraCloseRequested = true;
+                };
+            }
+        })();
+        """
+    )
+
+    return browser, context
+
+
+def wait_for_rera_ready(page, timeout_ms=120000):
+    deadline = time.time() + (timeout_ms / 1000)
+
+    while time.time() < deadline:
+        if page.is_closed():
+            raise RuntimeError("RERA page closed before it became ready.")
+
+        try:
+            table_count = page.locator("table").count()
+            search_count = page.locator(
+                ".dataTables_filter input, input[type='search'], "
+                "input[placeholder*='Search' i]"
+            ).count()
+
+            if table_count > 0:
+                page.wait_for_timeout(1200)
+                return
+        except Exception:
+            pass
+
+        page.wait_for_timeout(500)
+
+    raise TimeoutError(
+        "The RERA page opened, but the project table "
+        "did not become ready within the allowed time."
+    )
+
+
+def open_rera_page(context, attempts=3):
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        page = context.new_page()
+        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(45000)
+
+        try:
+            page.goto(
+                RERA_URL,
+                wait_until="commit",
+                timeout=45000,
+            )
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            wait_for_rera_ready(page, timeout_ms=120000)
+            return page
+
+        except Exception as error:
+            last_error = error
+
+            try:
+                page.close()
+            except Exception:
+                pass
+
+            if attempt < attempts:
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(
+        f"Unable to open the Karnataka RERA portal after {attempts} attempts: "
+        f"{last_error}"
+    )
+
+
+def find_rera_search_input(page):
+    selectors = [
+        ".dataTables_filter input:visible",
+        "input[type='search']:visible",
+        "input[placeholder*='Search' i]:visible",
+        "input[aria-label*='Search' i]:visible",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+        for index in range(locator.count()):
+            item = locator.nth(index)
+            try:
+                if item.is_visible() and item.is_enabled():
+                    return item
+            except Exception:
+                continue
+
+    raise RuntimeError("RERA search field not found.")
+
+
+def wait_for_rera_filter(page):
+    try:
+        processing = page.locator(".dataTables_processing")
+        if processing.count():
+            processing.first.wait_for(state="hidden", timeout=30000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1200)
+
+
+def fill_rera_search(page, value):
+    try:
+        search_input = find_rera_search_input(page)
+    except Exception:
+        return False
+
+    search_input.scroll_into_view_if_needed()
+    search_input.fill("")
+    search_input.fill(str(value))
+    search_input.evaluate(
+        """
+        element => {
+            element.dispatchEvent(new Event("input", {bubbles: true}));
+            element.dispatchEvent(new KeyboardEvent("keyup", {bubbles: true}));
+            element.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+        """
+    )
+    wait_for_rera_filter(page)
+    return True
+
+
+def mark_project_details_across_pages(
+    page,
+    registration_number,
+    project_name,
+    promoter_name,
+    max_pages=75,
+):
+    last_result = {
+        "success": False,
+        "reason": "Selected project row not found.",
+    }
+
+    for _ in range(max_pages):
+        last_result = mark_project_details_icon(
+            page,
+            registration_number,
+            project_name,
+            promoter_name,
+        )
+
+        if last_result.get("success"):
+            return last_result
+
+        next_button = find_rera_next_button(page)
+        if next_button is None:
+            break
+
+        table = read_rera_table(page)
+        previous = json.dumps(table.get("rows", [])[:1], ensure_ascii=False)
+
+        next_button.click(force=True)
+        wait_for_rera_filter(page)
+
+        current = json.dumps(
+            read_rera_table(page).get("rows", [])[:1],
+            ensure_ascii=False,
+        )
+
+        if current == previous:
+            break
+
+    return last_result
+
+
+def read_rera_table(page):
+    return page.evaluate(
+        r"""
+        () => {
+            const clean = value => (value || "")
+                .normalize("NFKC")
+                .replace(/\u00a0/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+
+            const visible = element => {
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden";
+            };
+
+            const tables = Array.from(document.querySelectorAll("table"))
+                .filter(visible);
+
+            const table = tables.find(candidate => {
+                const headers = Array.from(
+                    candidate.querySelectorAll("thead th, tr:first-child th")
+                ).map(header => clean(
+                    header.innerText || header.textContent
+                ).toLowerCase());
+
+                return headers.some(text => text.includes("promoter")) &&
+                    headers.some(text => text.includes("project"));
+            });
+
+            if (!table) return {headers: [], rows: []};
+
+            let headers = Array.from(table.querySelectorAll("thead th"))
+                .map(header => clean(header.innerText || header.textContent));
+
+            if (!headers.length) {
+                headers = Array.from(table.querySelectorAll("tr:first-child th"))
+                    .map(header => clean(header.innerText || header.textContent));
+            }
+
+            const rows = Array.from(table.querySelectorAll("tbody tr"))
+                .filter(visible)
+                .map(row => ({
+                    values: Array.from(row.querySelectorAll("td"))
+                        .map(cell => clean(cell.innerText || cell.textContent))
+                }))
+                .filter(row => row.values.some(Boolean));
+
+            return {headers, rows};
+        }
+        """
+    )
+
+
+def header_index(headers, predicate):
+    for index, header in enumerate(headers):
+        if predicate(rera_norm(header)):
+            return index
+    return -1
+
+
+def projects_from_table(table):
+    headers = table.get("headers", [])
+    rows = table.get("rows", [])
+
+    registration_index = header_index(
+        headers,
+        lambda value: "registration" in value,
+    )
+    promoter_index = header_index(
+        headers,
+        lambda value: "promoter" in value,
+    )
+    project_index = header_index(
+        headers,
+        lambda value: (
+            "project" in value
+            and "view" not in value
+            and "detail" not in value
+        ),
+    )
+    type_index = header_index(
+        headers,
+        lambda value: value == "type" or "project type" in value,
+    )
+    district_index = header_index(
+        headers,
+        lambda value: "district" in value,
+    )
+    taluk_index = header_index(
+        headers,
+        lambda value: "taluk" in value,
+    )
+
+    projects = []
+
+    for row in rows:
+        values = row.get("values", [])
+
+        def at(index):
+            return values[index] if 0 <= index < len(values) else ""
+
+        registration = at(registration_index)
+        if not registration:
+            registration = next(
+                (
+                    value
+                    for value in values
+                    if "PRM/KA/RERA" in value.upper()
+                ),
+                "",
+            )
+
+        projects.append(
+            {
+                "registration_number": registration,
+                "promoter_name": at(promoter_index),
+                "project_name": at(project_index),
+                "project_type": at(type_index),
+                "district": at(district_index),
+                "taluk": at(taluk_index),
+            }
+        )
+
+    return projects
+
+
+def find_rera_next_button(page):
+    selectors = [
+        "a.paginate_button.next:not(.disabled):visible",
+        "li.next:not(.disabled) a:visible",
+        "button:has-text('Next'):not([disabled]):visible",
+        "a:has-text('Next'):visible",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+        for index in range(locator.count()):
+            item = locator.nth(index)
+            try:
+                classes = (item.get_attribute("class") or "").lower()
+                aria_disabled = (item.get_attribute("aria-disabled") or "").lower()
+                if (
+                    item.is_visible()
+                    and "disabled" not in classes
+                    and aria_disabled != "true"
+                ):
+                    return item
+            except Exception:
+                continue
+
+    return None
+
+
+rera_read_table = read_rera_table
+rera_projects_from_table = projects_from_table
+rera_next_button = find_rera_next_button
+
+
+def search_rera_projects_on_open_page(
+    page,
+    payload,
+):
+    """
+    Searches using an already-open RERA browser page.
+
+    This function does not open or close a browser.
+    Therefore, when one result is found, the same page can
+    continue directly to View Project Details and Print.
+    """
+
+    query = rerapdf_clean(payload.get("query", ""))
+    search_type = rerapdf_norm(payload.get("searchType", ""))
+
+    try:
+        max_pages = int(payload.get("maxPages", 25))
+    except (TypeError, ValueError):
+        max_pages = 25
+
+    try:
+        max_results = int(payload.get("maxResults", 500))
+    except (TypeError, ValueError):
+        max_results = 500
+
+    max_pages = max(1, min(max_pages, 100))
+    max_results = max(1, min(max_results, 5000))
+
+    if search_type not in {"promoter", "project", "registration"}:
+        raise RuntimeError(
+            "searchType must be promoter, project, or registration."
+        )
+
+    if len(query) < 2:
+        raise RuntimeError("Enter at least two characters.")
+
+    rerapdf_fill_search(page, query)
+
+    results = []
+    seen = set()
+    normalized_query = rerapdf_norm(query)
+    registration_query = re.sub(r"\s+", "", normalized_query)
+
+    for _ in range(max_pages):
+        table_data = rera_read_table(page)
+        projects = rera_projects_from_table(table_data)
+
+        for project in projects:
+            if search_type == "promoter":
+                searched_value = project.get("promoter_name", "")
+            elif search_type == "project":
+                searched_value = project.get("project_name", "")
+            else:
+                searched_value = project.get("registration_number", "")
+
+            normalized_value = rerapdf_norm(searched_value)
+
+            if search_type == "registration":
+                registration_value = re.sub(r"\s+", "", normalized_value)
+                if (
+                    registration_query not in registration_value
+                    and registration_value not in registration_query
+                ):
+                    continue
+            elif normalized_query not in normalized_value:
+                continue
+
+            unique_key = "|".join(
+                [
+                    rerapdf_norm(project.get("registration_number", "")),
+                    rerapdf_norm(project.get("project_name", "")),
+                    rerapdf_norm(project.get("promoter_name", "")),
+                ]
+            )
+
+            if unique_key in seen:
+                continue
+
+            seen.add(unique_key)
+            results.append(project)
+
+            if len(results) >= max_results:
+                break
+
+        if len(results) >= max_results:
+            break
+
+        next_button = rera_next_button(page)
+        if next_button is None:
+            break
+
+        previous_first_row = json.dumps(
+            table_data.get("rows", [])[:1],
+            ensure_ascii=False,
+        )
+
+        next_button.click(force=True)
+        page.wait_for_timeout(1200)
+
+        current_table = rera_read_table(page)
+        current_first_row = json.dumps(
+            current_table.get("rows", [])[:1],
+            ensure_ascii=False,
+        )
+
+        if current_first_row == previous_first_row:
+            break
+
+    return {
+        "success": True,
+        "type": "RERA_PROJECT_SEARCH",
+        "searchType": search_type,
+        "query": query,
+        "count": len(results),
+        "results": results,
+    }
+
+def search_rera_projects(data):
+    query = rera_clean(data.get("query"))
+    search_type = rera_norm(data.get("searchType"))
+
+    if search_type not in {"promoter", "project"}:
+        raise ValueError("searchType must be 'promoter' or 'project'.")
+    if len(query) < 2:
+        raise ValueError("Enter at least two characters.")
+
+    max_pages = max(1, min(int(data.get("maxPages", 25)), 100))
+    max_results = max(1, min(int(data.get("maxResults", 500)), 5000))
+
+    with sync_playwright() as playwright:
+        browser = context = page = None
+        try:
+            browser, context = create_rera_browser(
+                playwright,
+                headless=data.get("headless", True),
+                load_assets=False,
+            )
+            page = open_rera_page(context)
+            fill_rera_search(page, query)
+
+            results = []
+            seen = set()
+
+            for _ in range(max_pages):
+                table = read_rera_table(page)
+                projects = projects_from_table(table)
+
+                for project in projects:
+                    searched_value = (
+                        project.get("promoter_name", "")
+                        if search_type == "promoter"
+                        else project.get("project_name", "")
+                    )
+
+                    if rera_norm(query) not in rera_norm(searched_value):
+                        continue
+
+                    key = "|".join(
+                        [
+                            rera_norm(project.get("registration_number")),
+                            rera_norm(project.get("project_name")),
+                            rera_norm(project.get("promoter_name")),
+                        ]
+                    )
+
+                    if key in seen:
+                        continue
+
+                    seen.add(key)
+                    results.append(project)
+
+                    if len(results) >= max_results:
+                        break
+
+                if len(results) >= max_results:
+                    break
+
+                next_button = find_rera_next_button(page)
+                if next_button is None:
+                    break
+
+                previous = json.dumps(table.get("rows", [])[:1], ensure_ascii=False)
+                next_button.click(force=True)
+                wait_for_rera_filter(page)
+                current = json.dumps(
+                    read_rera_table(page).get("rows", [])[:1],
+                    ensure_ascii=False,
+                )
+
+                if current == previous:
+                    break
+
+            return {
+                "success": True,
+                "type": "RERA_PROJECT_SEARCH",
+                "searchType": search_type,
+                "query": query,
+                "count": len(results),
+                "results": results,
+            }
+
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+
+# =========================================================
+# COMMON HELPERS
+# =========================================================
+
+def rerapdf_clean(value: Any) -> str:
+    text = unicodedata.normalize(
+        "NFKC",
+        str(value or ""),
+    )
+
+    text = text.replace(
+        "\u00a0",
+        " ",
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+
+def rerapdf_norm(value: Any) -> str:
+    return rerapdf_clean(
+        value
+    ).lower()
+
+
+def rerapdf_safe(value: Any) -> str:
+    text = re.sub(
+        r'[<>:"/\\|?*\x00-\x1f]+',
+        "_",
+        rerapdf_clean(value),
+    )
+
+    text = re.sub(
+        r"\s+",
+        "_",
+        text,
+    ).strip("._")
+
+    return (
+        text or "RERA_PROJECT"
+    )[:120]
+
+
+# =========================================================
+# BROWSER
+# =========================================================
+
+def rerapdf_launch(
+    playwright,
+    headless: bool,
+):
+    browser = playwright.chromium.launch(
+        headless=bool(headless),
+        slow_mo=80,
+        args=[
+            "--disable-features=Translate",
+            "--disable-translate",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--start-maximized",
+        ],
+    )
+
+    context = browser.new_context(
+        locale="en-IN",
+        viewport={
+            "width": 1800,
+            "height": 1100,
+        },
+        accept_downloads=True,
+        ignore_https_errors=True,
+    )
+
+    return browser, context
+
+
+def rerapdf_open_portal(context):
+    last_error = None
+
+    for attempt in range(1, 4):
+        page = context.new_page()
+
+        page.set_default_timeout(
+            45000
+        )
+
+        page.set_default_navigation_timeout(
+            60000
+        )
+
+        try:
+            # Do not wait for domcontentloaded.
+            # This portal may keep some resources pending.
+            page.goto(
+                RERA_URL,
+                wait_until="commit",
+                timeout=45000,
+            )
+
+            page.wait_for_selector(
+                (
+                    ".dataTables_filter input, "
+                    "input[type='search'], "
+                    "table"
+                ),
+                state="attached",
+                timeout=120000,
+            )
+
+            page.wait_for_timeout(
+                2500
+            )
+
+            return page
+
+        except Exception as error:
+            last_error = error
+
+            try:
+                page.close()
+            except Exception:
+                pass
+
+            if attempt < 3:
+                time.sleep(
+                    attempt * 2
+                )
+
+    raise RuntimeError(
+        "Unable to open Karnataka "
+        f"RERA portal: {last_error}"
+    )
+
+
+# =========================================================
+# SEARCH FIELD
+# =========================================================
+
+def rerapdf_find_search(page):
+    selectors = [
+        ".dataTables_filter input:visible",
+        "input[type='search']:visible",
+        (
+            "input[placeholder*='Search' i]"
+            ":visible"
+        ),
+        (
+            "input[aria-label*='Search' i]"
+            ":visible"
+        ),
+    ]
+
+    for selector in selectors:
+        items = page.locator(
+            selector
+        )
+
+        for index in range(
+            items.count()
+        ):
+            item = items.nth(
+                index
+            )
+
+            try:
+                if (
+                    item.is_visible()
+                    and item.is_enabled()
+                ):
+                    return item
+            except Exception:
+                continue
+
+    raise RuntimeError(
+        "RERA search field was not found."
+    )
+
+
+def rerapdf_fill_search(
+    page,
+    value: str,
+):
+    field = rerapdf_find_search(
+        page
+    )
+
+    field.scroll_into_view_if_needed()
+
+    field.fill("")
+    field.fill(value)
+
+    field.evaluate(
+        """
+        element => {
+            element.dispatchEvent(
+                new Event(
+                    "input",
+                    {bubbles: true}
+                )
+            );
+
+            element.dispatchEvent(
+                new KeyboardEvent(
+                    "keyup",
+                    {bubbles: true}
+                )
+            );
+
+            element.dispatchEvent(
+                new Event(
+                    "change",
+                    {bubbles: true}
+                )
+            );
+        }
+        """
+    )
+
+    page.wait_for_timeout(
+        2200
+    )
+
+
+# =========================================================
+# FIND VIEW PROJECT DETAILS ICON
+# =========================================================
+
+def rerapdf_mark_details(
+    page,
+    registration: str,
+    project: str,
+    promoter: str,
+):
+    return page.evaluate(
+        r"""
+        ({
+            registration,
+            project,
+            promoter
+        }) => {
+            const normalize = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+            const visible = element => {
+                if (!element) {
+                    return false;
+                }
+
+                const rectangle =
+                    element.getBoundingClientRect();
+
+                const style =
+                    getComputedStyle(element);
+
+                return (
+                    rectangle.width > 0 &&
+                    rectangle.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden"
+                );
+            };
+
+            const table = Array.from(
+                document.querySelectorAll("table")
+            )
+                .filter(visible)
+                .find(candidate => {
+                    const headers = Array.from(
+                        candidate.querySelectorAll(
+                            "thead th, " +
+                            "tr:first-child th"
+                        )
+                    ).map(header =>
+                        normalize(
+                            header.innerText ||
+                            header.textContent
+                        )
+                    );
+
+                    return (
+                        headers.some(
+                            value =>
+                                value.includes(
+                                    "promoter"
+                                )
+                        ) &&
+                        headers.some(
+                            value =>
+                                value.includes(
+                                    "project"
+                                )
+                        )
+                    );
+                });
+
+            if (!table) {
+                return {
+                    success: false,
+                    reason:
+                        "Project table not found"
+                };
+            }
+
+            let headers = Array.from(
+                table.querySelectorAll(
+                    "thead th"
+                )
+            ).map(header =>
+                normalize(
+                    header.innerText ||
+                    header.textContent
+                )
+            );
+
+            if (!headers.length) {
+                headers = Array.from(
+                    table.querySelectorAll(
+                        "tr:first-child th"
+                    )
+                ).map(header =>
+                    normalize(
+                        header.innerText ||
+                        header.textContent
+                    )
+                );
+            }
+
+            const registrationIndex =
+                headers.findIndex(
+                    value =>
+                        value.includes(
+                            "registration"
+                        )
+                );
+
+            const promoterIndex =
+                headers.findIndex(
+                    value =>
+                        value.includes(
+                            "promoter"
+                        )
+                );
+
+            const projectIndex =
+                headers.findIndex(
+                    value =>
+                        value.includes(
+                            "project"
+                        ) &&
+                        !value.includes(
+                            "view"
+                        ) &&
+                        !value.includes(
+                            "detail"
+                        )
+                );
+
+            let detailsIndex =
+                headers.findIndex(
+                    value =>
+                        value.includes(
+                            "view project details"
+                        ) ||
+                        (
+                            value.includes("view") &&
+                            value.includes("project")
+                        )
+                );
+
+            const wantedRegistration =
+                normalize(registration);
+
+            const wantedProject =
+                normalize(project);
+
+            const wantedPromoter =
+                normalize(promoter);
+
+            let matchedRow = null;
+
+            const rows = Array.from(
+                table.querySelectorAll(
+                    "tbody tr"
+                )
+            ).filter(visible);
+
+            for (const row of rows) {
+                const cells = Array.from(
+                    row.querySelectorAll("td")
+                );
+
+                if (!cells.length) {
+                    continue;
+                }
+
+                const values = cells.map(
+                    cell =>
+                        normalize(
+                            cell.innerText ||
+                            cell.textContent
+                        )
+                );
+
+                const registrationValue =
+                    registrationIndex >= 0
+                        ? values[
+                            registrationIndex
+                        ]
+                        : (
+                            values.find(
+                                value =>
+                                    value.includes(
+                                        "prm/ka/rera"
+                                    )
+                            ) || ""
+                        );
+
+                const projectValue =
+                    projectIndex >= 0
+                        ? values[
+                            projectIndex
+                        ]
+                        : "";
+
+                const promoterValue =
+                    promoterIndex >= 0
+                        ? values[
+                            promoterIndex
+                        ]
+                        : "";
+
+                const registrationMatches =
+                    wantedRegistration &&
+                    (
+                        registrationValue ===
+                            wantedRegistration ||
+                        registrationValue.includes(
+                            wantedRegistration
+                        ) ||
+                        wantedRegistration.includes(
+                            registrationValue
+                        )
+                    );
+
+                const namesMatch =
+                    wantedProject &&
+                    projectValue.includes(
+                        wantedProject
+                    ) &&
+                    (
+                        !wantedPromoter ||
+                        promoterValue.includes(
+                            wantedPromoter
+                        )
+                    );
+
+                if (
+                    registrationMatches ||
+                    (
+                        !wantedRegistration &&
+                        namesMatch
+                    )
+                ) {
+                    matchedRow = row;
+                    break;
+                }
+            }
+
+            if (!matchedRow) {
+                return {
+                    success: false,
+                    reason:
+                        "Selected project row not found"
+                };
+            }
+
+            const cells = Array.from(
+                matchedRow.querySelectorAll(
+                    "td"
+                )
+            );
+
+            if (
+                detailsIndex < 0 &&
+                projectIndex >= 0
+            ) {
+                detailsIndex =
+                    projectIndex + 1;
+            }
+
+            if (
+                detailsIndex < 0 ||
+                detailsIndex >= cells.length
+            ) {
+                detailsIndex =
+                    cells.findIndex(
+                        cell =>
+                            cell.querySelector(
+                                "a, button, input, " +
+                                "[onclick], " +
+                                "[role='button'], " +
+                                "img, svg, i"
+                            )
+                    );
+            }
+
+            if (detailsIndex < 0) {
+                return {
+                    success: false,
+                    reason:
+                        "View Project Details column not found"
+                };
+            }
+
+            const detailsCell =
+                cells[detailsIndex];
+
+            const icon =
+                detailsCell.querySelector(
+                    "img, svg, i, span"
+                );
+
+            const target =
+                detailsCell.querySelector(
+                    "a[href], button, " +
+                    "input[type='button'], " +
+                    "input[type='submit'], " +
+                    "[role='button'], " +
+                    "[onclick]"
+                ) ||
+                (
+                    icon &&
+                    (
+                        icon.closest(
+                            "a, button, " +
+                            "[role='button'], " +
+                            "[onclick]"
+                        ) ||
+                        icon
+                    )
+                ) ||
+                detailsCell;
+
+            document.querySelectorAll(
+                "[data-rera-details-target]"
+            ).forEach(element =>
+                element.removeAttribute(
+                    "data-rera-details-target"
+                )
+            );
+
+            target.setAttribute(
+                "data-rera-details-target",
+                "true"
+            );
+
+            target.scrollIntoView({
+                block: "center",
+                inline: "center"
+            });
+
+            return {
+                success: true
+            };
+        }
+        """,
+        {
+            "registration":
+                registration,
+            "project":
+                project,
+            "promoter":
+                promoter,
+        },
+    )
+
+
+# =========================================================
+# WAIT FOR PROJECT DETAILS
+# =========================================================
+
+def rerapdf_page_score(page) -> int:
+    try:
+        text = rerapdf_norm(
+            page.locator("body").inner_text(
+                timeout=5000
+            )
+        )
+    except Exception:
+        return 0
+
+    markers = [
+        "project registration details",
+        "promoter details",
+        "authorized signatory",
+        "project details",
+        "land details",
+        "land survey details",
+        "uploaded documents",
+        "bank details",
+    ]
+
+    return (
+        sum(
+            100
+            for marker in markers
+            if marker in text
+        )
+        +
+        min(
+            len(text),
+            50000,
+        ) // 100
+    )
+
+
+def rerapdf_wait_details(
+    context,
+    list_page,
+    pages_before,
+    timeout=60,
+):
+    deadline = (
+        time.time() + timeout
+    )
+
+    best_page = None
+    best_score = 0
+
+    while time.time() < deadline:
+        candidates = [
+            list_page,
+            *[
+                page
+                for page in context.pages
+                if page not in pages_before
+            ],
+        ]
+
+        for candidate in candidates:
+            if candidate.is_closed():
+                continue
+
+            score = rerapdf_page_score(
+                candidate
+            )
+
+            if score > best_score:
+                best_page = candidate
+                best_score = score
+
+            if score >= 300:
+                return candidate
+
+        list_page.wait_for_timeout(
+            350
+        )
+
+    if (
+        best_page is not None
+        and best_score >= 250
+    ):
+        return best_page
+
+    raise RuntimeError(
+        "Project Registration Details "
+        "did not open."
+    )
+
+
+def rerapdf_wait_stable(
+    page,
+    timeout=30,
+):
+    deadline = (
+        time.time() + timeout
+    )
+
+    previous = None
+    stable_count = 0
+
+    while time.time() < deadline:
+        try:
+            current = page.evaluate(
+                """
+                () => ({
+                    textLength:
+                        (
+                            document.body.innerText
+                            || ""
+                        ).length,
+
+                    height:
+                        Math.max(
+                            document.body.scrollHeight,
+                            document.documentElement
+                                .scrollHeight
+                        ),
+
+                    loadedImages:
+                        Array.from(
+                            document.images
+                        ).filter(
+                            image =>
+                                image.complete
+                        ).length,
+
+                    totalImages:
+                        document.images.length
+                })
+                """
+            )
+
+        except Exception:
+            page.wait_for_timeout(
+                400
+            )
+            continue
+
+        if (
+            current == previous
+            and current["textLength"] > 800
+        ):
+            stable_count += 1
+
+            if stable_count >= 3:
+                return
+        else:
+            stable_count = 0
+
+        previous = current
+
+        page.wait_for_timeout(
+            500
+        )
+
+
+# =========================================================
+# PRINT BUTTON
+# =========================================================
+
+def rerapdf_find_print(page):
+    selectors = [
+        "button:has-text('Print'):visible",
+        "a:has-text('Print'):visible",
+        "input[value*='Print' i]:visible",
+        "[onclick*='print' i]:visible",
+    ]
+
+    for selector in selectors:
+        items = page.locator(
+            selector
+        )
+
+        for index in range(
+            items.count()
+        ):
+            item = items.nth(
+                index
+            )
+
+            try:
+                if item.is_visible():
+                    return item
+            except Exception:
+                continue
+
+    raise RuntimeError(
+        "Print button beside Project "
+        "Registration Details was not found."
+    )
+
+
+def rerapdf_install_print_interceptor(page):
+    page.evaluate(
+        """
+        () => {
+            window.__reraPrintRequested =
+                false;
+
+            try {
+                Object.defineProperty(
+                    window,
+                    "print",
+                    {
+                        configurable: true,
+                        writable: true,
+
+                        value: () => {
+                            window
+                                .__reraPrintRequested =
+                                true;
+                        }
+                    }
+                );
+            }
+            catch (error) {
+                window.print = () => {
+                    window
+                        .__reraPrintRequested =
+                        true;
+                };
+            }
+        }
+        """
+    )
+
+
+# =========================================================
+# EXTRACT ONLY PROJECT DETAILS
+# =========================================================
+
+def rerapdf_serialize_details(page):
+    return page.evaluate(
+        r"""
+        async () => {
+            const normalize = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+            /*
+            Trigger the same layout lifecycle used by
+            Chrome Print Preview.
+            */
+            window.dispatchEvent(
+                new Event("beforeprint")
+            );
+
+            document.dispatchEvent(
+                new Event("beforeprint")
+            );
+
+            const heading = Array.from(
+                document.querySelectorAll(
+                    "h1, h2, h3, h4, h5, " +
+                    "div, span"
+                )
+            ).find(element =>
+                normalize(
+                    element.innerText ||
+                    element.textContent
+                ) ===
+                "project registration details"
+            );
+
+            if (!heading) {
+                throw new Error(
+                    "Project Registration Details heading not found"
+                );
+            }
+
+            /*
+            Prefer the details modal/dialog. This prevents
+            the underlying Project Applications table and
+            site footer from appearing in the PDF.
+            */
+            let root = heading.closest(
+                ".modal, [role='dialog']"
+            );
+
+            if (!root) {
+                let current =
+                    heading.parentElement;
+
+                while (
+                    current &&
+                    current !== document.body
+                ) {
+                    const text = normalize(
+                        current.innerText ||
+                        current.textContent
+                    );
+
+                    const markerCount = [
+                        "project registration details",
+                        "promoter details",
+                        "project details",
+                        "authorized signatory",
+                        "land details",
+                        "uploaded documents"
+                    ].filter(
+                        marker =>
+                            text.includes(marker)
+                    ).length;
+
+                    if (
+                        markerCount >= 3 &&
+                        text.length > 1000
+                    ) {
+                        root = current;
+                        break;
+                    }
+
+                    current =
+                        current.parentElement;
+                }
+            }
+
+            if (!root) {
+                root = document.body;
+            }
+
+            /*
+            Canvas pixels are not included by outerHTML.
+            Convert maps/charts to images before cloning.
+            */
+            root.querySelectorAll(
+                "canvas"
+            ).forEach(canvas => {
+                try {
+                    const image =
+                        document.createElement(
+                            "img"
+                        );
+
+                    image.src =
+                        canvas.toDataURL(
+                            "image/png"
+                        );
+
+                    image.style.cssText =
+                        canvas.style.cssText;
+
+                    image.width =
+                        canvas.width;
+
+                    image.height =
+                        canvas.height;
+
+                    canvas.replaceWith(
+                        image
+                    );
+                }
+                catch (error) {
+                }
+            });
+
+            /*
+            Convert relative links/images to absolute URLs.
+            */
+            root.querySelectorAll(
+                "[src]"
+            ).forEach(element => {
+                try {
+                    element.setAttribute(
+                        "src",
+                        element.src
+                    );
+                }
+                catch (error) {
+                }
+            });
+
+            root.querySelectorAll(
+                "a[href]"
+            ).forEach(element => {
+                try {
+                    element.setAttribute(
+                        "href",
+                        element.href
+                    );
+                }
+                catch (error) {
+                }
+            });
+
+            /*
+            Preserve entered form values.
+            */
+            root.querySelectorAll(
+                "input, textarea, select"
+            ).forEach(element => {
+                if (
+                    element.tagName ===
+                    "TEXTAREA"
+                ) {
+                    element.textContent =
+                        element.value;
+                }
+                else if (
+                    element.tagName ===
+                    "SELECT"
+                ) {
+                    Array.from(
+                        element.options
+                    ).forEach(option =>
+                        option.toggleAttribute(
+                            "selected",
+                            option.selected
+                        )
+                    );
+                }
+                else {
+                    element.setAttribute(
+                        "value",
+                        element.value || ""
+                    );
+                }
+            });
+
+            /*
+            Reveal every tab/collapsed section so all
+            Promoter, Land, Project, Bank, Document and
+            other data becomes part of the PDF.
+            */
+            root.querySelectorAll(
+                ".tab-pane, " +
+                ".collapse, " +
+                ".accordion-collapse, " +
+                ".panel-collapse, " +
+                "[hidden]"
+            ).forEach(element => {
+                element.hidden = false;
+
+                element.removeAttribute(
+                    "aria-hidden"
+                );
+
+                element.style.setProperty(
+                    "display",
+                    "block",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "visibility",
+                    "visible",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "opacity",
+                    "1",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "height",
+                    "auto",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "max-height",
+                    "none",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "overflow",
+                    "visible",
+                    "important"
+                );
+            });
+
+            root.setAttribute(
+                "data-rera-export-root",
+                "true"
+            );
+
+            const styleAssets = [
+                ...Array.from(
+                    document.querySelectorAll(
+                        "link[rel='stylesheet']"
+                    )
+                ).map(link =>
+                    `<link rel="stylesheet" ` +
+                    `href="${link.href}" ` +
+                    `media="all">`
+                ),
+
+                ...Array.from(
+                    document.querySelectorAll(
+                        "style"
+                    )
+                ).map(style =>
+                    style.outerHTML
+                )
+            ].join("\n");
+
+            return {
+                baseUrl:
+                    location.href,
+
+                title:
+                    document.title ||
+                    "RERA Project Details",
+
+                bodyClass:
+                    document.body.className ||
+                    "",
+
+                styleAssets:
+                    styleAssets,
+
+                rootHtml:
+                    root.outerHTML
+            };
+        }
+        """
+    )
+
+
+# =========================================================
+# CREATE CLEAN PRINT PAGE
+# =========================================================
+
+def rerapdf_create_clean_page(
+    context,
+    details_page,
+):
+    data = rerapdf_serialize_details(
+        details_page
+    )
+
+    export_page = context.new_page()
+
+    export_page.set_default_timeout(
+        60000
+    )
+
+    html = f"""
+    <!doctype html>
+    <html lang="en">
+
+    <head>
+        <meta charset="utf-8">
+
+        <base href="{data['baseUrl']}">
+
+        <title>{data['title']}</title>
+
+        {data['styleAssets']}
+
+        <style>
+            @page {{
+                size: A4 portrait;
+                margin: 10mm 8mm 12mm 8mm;
+            }}
+
+            html,
+            body {{
+                margin: 0 !important;
+                padding: 0 !important;
+                background: white !important;
+                width: auto !important;
+                height: auto !important;
+                overflow: visible !important;
+            }}
+
+            [data-rera-export-root],
+            [data-rera-export-root]
+                .modal-dialog,
+            [data-rera-export-root]
+                .modal-content,
+            [data-rera-export-root]
+                .modal-body {{
+                display: block !important;
+                position: static !important;
+                inset: auto !important;
+                float: none !important;
+                transform: none !important;
+                opacity: 1 !important;
+                visibility: visible !important;
+                width: 100% !important;
+                max-width: none !important;
+                height: auto !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                box-shadow: none !important;
+                background: white !important;
+            }}
+
+            [data-rera-export-root]
+                .tab-pane,
+            [data-rera-export-root]
+                .collapse,
+            [data-rera-export-root]
+                .accordion-collapse,
+            [data-rera-export-root]
+                .panel-collapse {{
+                display: block !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                height: auto !important;
+                max-height: none !important;
+                overflow: visible !important;
+            }}
+
+            [data-rera-export-root]
+                button,
+            [data-rera-export-root]
+                input[type="button"],
+            [data-rera-export-root]
+                input[type="submit"],
+            [data-rera-export-root]
+                .close,
+            [data-rera-export-root]
+                .nav-tabs,
+            [data-rera-export-root]
+                .dataTables_filter,
+            [data-rera-export-root]
+                .dataTables_paginate,
+            [data-rera-export-root]
+                .dataTables_info {{
+                display: none !important;
+            }}
+
+            * {{
+                -webkit-print-color-adjust:
+                    exact !important;
+
+                print-color-adjust:
+                    exact !important;
+
+                box-sizing:
+                    border-box;
+            }}
+
+            table {{
+                border-collapse:
+                    collapse !important;
+
+                width:
+                    100% !important;
+            }}
+
+            thead {{
+                display:
+                    table-header-group !important;
+            }}
+
+            tfoot {{
+                display:
+                    table-footer-group !important;
+            }}
+
+            tr,
+            img,
+            .panel,
+            .card {{
+                break-inside:
+                    avoid;
+
+                page-break-inside:
+                    avoid;
+            }}
+
+            img {{
+                max-width:
+                    100% !important;
+
+                height:
+                    auto !important;
+            }}
+        </style>
+    </head>
+
+    <body class="{data['bodyClass']}">
+        {data['rootHtml']}
+    </body>
+
+    </html>
+    """
+
+    export_page.set_content(
+        html,
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+
+    try:
+        export_page.wait_for_load_state(
+            "networkidle",
+            timeout=30000,
+        )
+    except Exception:
+        pass
+
+    export_page.evaluate(
+        """
+        async () => {
+            if (
+                document.fonts &&
+                document.fonts.ready
+            ) {
+                await document.fonts.ready;
+            }
+
+            await Promise.all(
+                Array.from(
+                    document.images
+                ).map(image => {
+                    if (image.complete) {
+                        return Promise.resolve();
+                    }
+
+                    return new Promise(
+                        resolve => {
+                            image.addEventListener(
+                                "load",
+                                resolve,
+                                {once: true}
+                            );
+
+                            image.addEventListener(
+                                "error",
+                                resolve,
+                                {once: true}
+                            );
+
+                            setTimeout(
+                                resolve,
+                                10000
+                            );
+                        }
+                    );
+                })
+            );
+        }
+        """
+    )
+
+    export_page.emulate_media(
+        media="print"
+    )
+
+    export_page.wait_for_timeout(
+        1000
+    )
+
+    return export_page
+
+
+# =========================================================
+# SAVE EVERY PAGE INTO ONE PDF
+# =========================================================
+
+def rerapdf_save(
+    page,
+    output_path,
+):
+    page.pdf(
+        path=output_path,
+
+        format="A4",
+        landscape=False,
+
+        print_background=True,
+        prefer_css_page_size=False,
+
+        # Makes wide RERA tables fit clearly.
+        scale=0.88,
+
+        margin={
+            "top": "10mm",
+            "right": "7mm",
+            "bottom": "12mm",
+            "left": "7mm",
+        },
+
+        display_header_footer=True,
+
+        header_template=(
+            "<div style='"
+            "width:100%;"
+            "font-size:8px;"
+            "padding:0 8mm;"
+            "text-align:center;'>"
+            "RERA Project Details"
+            "</div>"
+        ),
+
+        footer_template=(
+            "<div style='"
+            "width:100%;"
+            "font-size:8px;"
+            "padding:0 8mm;'>"
+
+            "<span class='url'></span>"
+
+            "<span style='float:right'>"
+            "<span class='pageNumber'></span>"
+            "/"
+            "<span class='totalPages'></span>"
+            "</span>"
+
+            "</div>"
+        ),
+    )
+
+    if (
+        not os.path.isfile(
+            output_path
+        )
+        or os.path.getsize(
+            output_path
+        ) < 30000
+    ):
+        raise RuntimeError(
+            "Generated RERA PDF is "
+            "blank or incomplete."
+        )
+
+
+# =========================================================
+# COMPLETE PDF FLOW
+# =========================================================
+
+def rerapdf_create(data):
+    registration = rerapdf_clean(
+        data.get(
+            "registrationNumber"
+        )
+    )
+
+    project = rerapdf_clean(
+        data.get(
+            "projectName"
+        )
+    )
+
+    promoter = rerapdf_clean(
+        data.get(
+            "promoterName"
+        )
+    )
+
+    if (
+        not registration
+        and not project
+    ):
+        raise RuntimeError(
+            "registrationNumber or "
+            "projectName is required."
+        )
+
+    with sync_playwright() as playwright:
+        browser = None
+        context = None
+        active_page = None
+
+        try:
+            browser, context = (
+                rerapdf_launch(
+                    playwright,
+                    bool(
+                        data.get(
+                            "headless",
+                            True,
+                        )
+                    ),
+                )
+            )
+
+            list_page = (
+                rerapdf_open_portal(
+                    context
+                )
+            )
+
+            active_page = list_page
+
+            # ---------------------------------------------
+            # SEARCH EXACT PROJECT
+            # ---------------------------------------------
+
+            rerapdf_fill_search(
+                list_page,
+                registration or project,
+            )
+
+            marked = rerapdf_mark_details(
+                list_page,
+                registration,
+                project,
+                promoter,
+            )
+
+            if (
+                not marked.get("success")
+                and project
+            ):
+                rerapdf_fill_search(
+                    list_page,
+                    project,
+                )
+
+                marked = (
+                    rerapdf_mark_details(
+                        list_page,
+                        registration,
+                        project,
+                        promoter,
+                    )
+                )
+
+            if not marked.get(
+                "success"
+            ):
+                raise RuntimeError(
+                    marked.get("reason")
+                    or
+                    "View Project Details "
+                    "icon not found."
+                )
+
+            # ---------------------------------------------
+            # CLICK VIEW PROJECT DETAILS
+            # ---------------------------------------------
+
+            pages_before = list(
+                context.pages
+            )
+
+            target = list_page.locator(
+                "[data-rera-details-target='true']"
+            ).first
+
+            target.wait_for(
+                state="visible",
+                timeout=30000,
+            )
+
+            target.click(
+                force=True,
+                no_wait_after=True,
+            )
+
+            details_page = (
+                rerapdf_wait_details(
+                    context,
+                    list_page,
+                    pages_before,
+                )
+            )
+
+            active_page = details_page
+
+            rerapdf_wait_stable(
+                details_page
+            )
+
+            # ---------------------------------------------
+            # CLICK PRINT
+            # ---------------------------------------------
+
+            rerapdf_install_print_interceptor(
+                details_page
+            )
+
+            print_button = (
+                rerapdf_find_print(
+                    details_page
+                )
+            )
+
+            print_button.scroll_into_view_if_needed()
+
+            print_button.click(
+                force=True,
+                no_wait_after=True,
+            )
+
+            details_page.wait_for_timeout(
+                1000
+            )
+
+            # Trigger the same before-print phase
+            # used by Chrome Print Preview.
+            details_page.evaluate(
+                """
+                () => {
+                    window.dispatchEvent(
+                        new Event(
+                            "beforeprint"
+                        )
+                    );
+
+                    document.dispatchEvent(
+                        new Event(
+                            "beforeprint"
+                        )
+                    );
+                }
+                """
+            )
+
+            details_page.wait_for_timeout(
+                800
+            )
+
+            # ---------------------------------------------
+            # CREATE CLEAN PAGE FROM DETAILS ONLY
+            # ---------------------------------------------
+
+            export_page = (
+                rerapdf_create_clean_page(
+                    context,
+                    details_page,
+                )
+            )
+
+            active_page = export_page
+
+            # ---------------------------------------------
+            # SAVE COMPLETE MULTI-PAGE PDF
+            # ---------------------------------------------
+
+            timestamp = time.strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            project_file_part = rerapdf_safe(
+                project or registration
+            )
+
+            registration_file_part = rerapdf_safe(
+                registration or "PROJECT"
+            )
+
+            filename = (
+                f"RERA_{project_file_part}_"
+                f"{registration_file_part}_"
+                f"{timestamp}.pdf"
+            )
+
+            output_path = os.path.join(
+                RERA_PDF_DIR,
+                filename,
+            )
+
+            rerapdf_save(
+                export_page,
+                output_path,
+            )
+
+            return (
+                output_path,
+                filename,
+            )
+
+        except Exception as error:
+            raise RuntimeError(
+                "RERA PDF creation failed: "
+                f"{error}"
+            ) from error
+
+        finally:
+            if context is not None:
+                context.close()
+
+            if browser is not None:
+                browser.close()
+
+def create_rera_pdf(data):
+    return rerapdf_create(data)
+
+def create_rera_pdf_from_open_list_page(
+    context,
+    list_page,
+    selected_project,
+):
+    """
+    Continues from the browser page already used for search.
+
+    It does not reopen the Karnataka RERA portal.
+    """
+
+    registration = rerapdf_clean(
+        selected_project.get(
+            "registration_number",
+            "",
+        )
+    )
+
+    project = rerapdf_clean(
+        selected_project.get(
+            "project_name",
+            "",
+        )
+    )
+
+    promoter = rerapdf_clean(
+        selected_project.get(
+            "promoter_name",
+            "",
+        )
+    )
+
+    if not registration and not project:
+        raise RuntimeError(
+            "Selected RERA project does not contain "
+            "a registration number or project name."
+        )
+
+    # Return to the first filtered page when required.
+    first_button_selectors = [
+        (
+            "a.paginate_button.first"
+            ":not(.disabled):visible"
+        ),
+        (
+            "li.first:not(.disabled) "
+            "a:visible"
+        ),
+        "a:has-text('First'):visible",
+    ]
+
+    for selector in first_button_selectors:
+        first_button = list_page.locator(
+            selector
+        )
+
+        if first_button.count():
+            try:
+                candidate = first_button.first
+
+                classes = (
+                    candidate.get_attribute(
+                        "class"
+                    )
+                    or ""
+                ).lower()
+
+                if (
+                    candidate.is_visible()
+                    and "disabled" not in classes
+                ):
+                    candidate.click(
+                        force=True
+                    )
+
+                    list_page.wait_for_timeout(
+                        1000
+                    )
+
+                break
+
+            except Exception:
+                continue
+
+    # Filter the existing page by the exact project.
+    rerapdf_fill_search(
+        list_page,
+        registration or project,
+    )
+
+    marked = rerapdf_mark_details(
+        list_page,
+        registration,
+        project,
+        promoter,
+    )
+
+    if (
+        not marked.get("success")
+        and project
+    ):
+        rerapdf_fill_search(
+            list_page,
+            project,
+        )
+
+        marked = rerapdf_mark_details(
+            list_page,
+            registration,
+            project,
+            promoter,
+        )
+
+    if not marked.get("success"):
+        raise RuntimeError(
+            marked.get("reason")
+            or "View Project Details icon was not found."
+        )
+
+    # -----------------------------------------------------
+    # CLICK VIEW PROJECT DETAILS
+    # -----------------------------------------------------
+
+    pages_before = list(
+        context.pages
+    )
+
+    target = list_page.locator(
+        "[data-rera-details-target='true']"
+    ).first
+
+    target.wait_for(
+        state="visible",
+        timeout=30000,
+    )
+
+    target.click(
+        force=True,
+        no_wait_after=True,
+    )
+
+    details_page = rerapdf_wait_details(
+        context,
+        list_page,
+        pages_before,
+    )
+
+    rerapdf_wait_stable(
+        details_page
+    )
+
+    # -----------------------------------------------------
+    # CLICK PRINT
+    # -----------------------------------------------------
+
+    rerapdf_install_print_interceptor(
+        details_page
+    )
+
+    print_button = rerapdf_find_print(
+        details_page
+    )
+
+    print_button.scroll_into_view_if_needed()
+
+    print_button.click(
+        force=True,
+        no_wait_after=True,
+    )
+
+    details_page.wait_for_timeout(
+        1000
+    )
+
+    details_page.evaluate(
+        """
+        () => {
+            window.dispatchEvent(
+                new Event("beforeprint")
+            );
+
+            document.dispatchEvent(
+                new Event("beforeprint")
+            );
+        }
+        """
+    )
+
+    details_page.wait_for_timeout(
+        800
+    )
+
+    # -----------------------------------------------------
+    # COPY ONLY PROJECT DETAILS TO CLEAN PAGE
+    # -----------------------------------------------------
+
+    export_page = rerapdf_create_clean_page(
+        context,
+        details_page,
+    )
+
+    timestamp = time.strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    filename = (
+        f"RERA_"
+        f"{rerapdf_safe(project or registration)}_"
+        f"{rerapdf_safe(registration or 'PROJECT')}_"
+        f"{timestamp}.pdf"
+    )
+
+    output_path = os.path.join(
+        RERA_PDF_DIR,
+        filename,
+    )
+
+    try:
+        rerapdf_save(
+            export_page,
+            output_path,
+        )
+    finally:
+        try:
+            export_page.close()
+        except Exception:
+            pass
+
+    return output_path, filename
+
+# =========================================================
+# FASTAPI ROUTES
+# =========================================================
+
 @app.post("/api/fetch-rtc/auto")
 def fetch_rtc_auto(data: BhoomiRequest):
     try:
@@ -2010,9 +4671,205 @@ def akarband_options(data: AkarbandOptionsRequest):
         raise HTTPException(status_code=500, detail=str(error))
 
 
+@app.post("/api/rera/search")
+def rera_search(data: ReraSearchRequest):
+    try:
+        return search_rera_projects(data.model_dump())
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.post("/api/rera/project-pdf")
+def rera_project_pdf(data: ReraProjectPdfRequest):
+    try:
+        pdf_path, filename = create_rera_pdf(data.model_dump())
+
+        return {
+            "success": True,
+            "type": "RERA_COMPLETE_PROJECT_PDF",
+            "filename": filename,
+            "pdf": pdf_path,
+            "downloadUrl": f"/api/rera/download/{quote(filename)}",
+            "file_size": os.path.getsize(pdf_path),
+        }
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.get("/api/rera/download/{filename}")
+def rera_download(filename: str):
+    safe_name = os.path.basename(filename)
+
+    if not safe_name.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF filename.",
+        )
+
+    pdf_path = os.path.join(RERA_DOWNLOAD_DIR, safe_name)
+
+    if not os.path.isfile(pdf_path):
+        raise HTTPException(
+            status_code=404,
+            detail="RERA PDF not found.",
+        )
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=safe_name,
+    )
+
+@app.post("/api/rera")
+def rera_unified_api(
+    data: ReraUnifiedRequest,
+):
+    payload = data.model_dump()
+
+    action = rerapdf_norm(
+        payload.get("action", "")
+    )
+
+    # =====================================================
+    # SEARCH
+    # =====================================================
+
+    if action == "search":
+        browser = None
+        context = None
+
+        try:
+            with sync_playwright() as playwright:
+                browser, context = rerapdf_launch(
+                    playwright,
+                    bool(
+                        payload.get(
+                            "headless",
+                            True,
+                        )
+                    ),
+                )
+
+                list_page = rerapdf_open_portal(
+                    context
+                )
+
+                result = (
+                    search_rera_projects_on_open_page(
+                        list_page,
+                        payload,
+                    )
+                )
+
+                results = result.get(
+                    "results",
+                    [],
+                )
+
+                # -----------------------------------------
+                # NO RESULTS
+                # -----------------------------------------
+
+                if not results:
+                    return result
+
+                # -----------------------------------------
+                # MULTIPLE RESULTS
+                #
+                # Return JSON. The UI will show the
+                # project-selection dropdown.
+                # -----------------------------------------
+
+                if len(results) > 1:
+                    return result
+
+                # -----------------------------------------
+                # EXACTLY ONE RESULT
+                #
+                # Continue in this same browser and page.
+                # Do not reopen the RERA portal.
+                # -----------------------------------------
+
+                output_path, filename = (
+                    create_rera_pdf_from_open_list_page(
+                        context,
+                        list_page,
+                        results[0],
+                    )
+                )
+
+                return FileResponse(
+                    path=output_path,
+                    media_type="application/pdf",
+                    filename=filename,
+                    headers={
+                        "X-RERA-Result-Mode":
+                            "single-result-auto-pdf",
+                    },
+                )
+
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "RERA search failed: "
+                    f"{error}"
+                ),
+            ) from error
+
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    # =====================================================
+    # PDF FOR USER-SELECTED MULTIPLE RESULT
+    # =====================================================
+
+    if action == "pdf":
+        try:
+            output_path, filename = rerapdf_create(
+                payload
+            )
+
+            return FileResponse(
+                path=output_path,
+                media_type="application/pdf",
+                filename=filename,
+                headers={
+                    "X-RERA-Result-Mode":
+                        "selected-result-pdf",
+                },
+            )
+
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "RERA PDF creation failed: "
+                    f"{error}"
+                ),
+            ) from error
+
+    raise HTTPException(
+        status_code=400,
+        detail="action must be search or pdf.",
+    )
+
 if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=5000,
     )
+
+
+
