@@ -86,7 +86,7 @@ def render_survey_sketch_ui(api_base, master, districts, headless):
     }
 
     if st.button(
-        "📐 Download Survey Sketch", disabled=disabled, use_container_width=True
+        "📐 Download Survey Sketch", disabled=disabled, width="stretch"
     ):
         try:
             with st.spinner("Fetching Survey Sketch..."):

@@ -17,7 +17,7 @@ def render_mr_ui(api_base, master, districts, headless):
     if st.button(
         "🔍 Fetch Mutation Details",
         disabled=disabled,
-        use_container_width=True,
+        width="stretch",
     ):
         try:
             mr_payload = prepare_mr_payload(payload)
@@ -65,7 +65,7 @@ def render_mr_ui(api_base, master, districts, headless):
 
             if st.button(
                 "📥 Download Selected MR",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     selected_payload = st.session_state["mr_payload"].copy()

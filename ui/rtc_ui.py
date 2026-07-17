@@ -17,7 +17,7 @@ def render_rtc_ui(api_base, master, districts, headless):
     if st.button(
         "Download RTC",
         disabled=disabled,
-        use_container_width=True,
+        width="stretch",
     ):
         try:
             with st.spinner("Opening Bhoomi Portal and downloading RTC..."):

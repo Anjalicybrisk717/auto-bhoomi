@@ -287,7 +287,7 @@ def render_akarband_ui(api_base, master, districts, headless):
         clicked = st.button(
             "ಆಕಾರಬಂದ್ ಪಡೆಯಿರಿ",
             disabled=disabled,
-            use_container_width=True,
+            width="stretch",
         )
 
     if clicked:

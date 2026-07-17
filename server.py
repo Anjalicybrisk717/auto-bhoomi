@@ -3,10 +3,17 @@ import re
 import time
 import json
 import base64
+import mimetypes
 import uvicorn
 import unicodedata
+import zipfile
+import threading
+from typing import Any, Dict, List
+from urllib.parse import unquote, urljoin
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -15,11 +22,31 @@ MR_URL = "https://landrecords.karnataka.gov.in/Service11/MR_MutationExtract.aspx
 REVENUE_MAP_URL = "https://landrecords.karnataka.gov.in/service3/"
 SURVEY_SKETCH_URL = "https://rdservices.karnataka.gov.in/service84/"
 AKARBAND_URL = "https://bhoomojini.karnataka.gov.in/service39/"
+RERA_URL = "https://rera.karnataka.gov.in/viewAllCompletedProjects"
 
-with open("bhoomi-master-bilingual.json", "r", encoding="utf-8") as f:
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+RERA_DOWNLOAD_DIR = os.path.join(BASE_DIR, "rera_downloads")
+RERA_DEBUG_DIR = os.path.join(BASE_DIR, "rera_debug")
+RERA_DOCUMENT_ZIP_DIR = os.path.join(BASE_DIR, "rera_document_zips")
+
+os.makedirs(RERA_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(RERA_DEBUG_DIR, exist_ok=True)
+os.makedirs(RERA_DOCUMENT_ZIP_DIR, exist_ok=True)
+
+with open(
+    os.path.join(BASE_DIR, "bhoomi-master-bilingual.json"),
+    "r",
+    encoding="utf-8",
+) as f:
     bilingual_master = json.load(f)
 
 app = FastAPI(title="Bhoomi Automation API")
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 
 class BhoomiRequest(BaseModel):
@@ -69,6 +96,53 @@ class AkarbandRequest(BaseModel):
 
 class AkarbandOptionsRequest(AkarbandRequest):
     surveyNumber: str = ""
+
+class ReraSearchRequest(BaseModel):
+    searchType: str
+    query: str
+    headless: bool = True
+    maxPages: int = 25
+    maxResults: int = 500
+    requestId: str = ""
+
+
+RERA_CANCEL_EVENTS = {}
+RERA_CANCEL_LOCK = threading.Lock()
+
+
+def rera_cancel_event(request_id):
+    with RERA_CANCEL_LOCK:
+        return RERA_CANCEL_EVENTS.get(request_id)
+
+
+def rera_raise_if_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("RERA automation was cancelled by the user.")
+
+
+class ReraProjectPdfRequest(BaseModel):
+    registrationNumber: str = ""
+    projectName: str = ""
+    promoterName: str = ""
+    headless: bool = True
+
+
+class ReraDocumentsRequest(BaseModel):
+    registrationNumber: str = ""
+    projectName: str = ""
+    promoterName: str = ""
+    headless: bool = True
+
+
+class ReraDocumentsZipRequest(ReraDocumentsRequest):
+    documents: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ReraAllDocumentsZipRequest(BaseModel):
+    registrationNumber: str = ""
+    projectName: str = ""
+    promoterName: str = ""
+    headless: bool = True
 
 
 def safe_filename(value):
@@ -1953,6 +2027,3761 @@ def fetch_akarband_options(data):
         finally:
             browser.close()
 
+# =========================================================
+# TEXT HELPERS
+# =========================================================
+
+def rera_clean_text(value):
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    value = value.replace("\u00a0", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def rera_normalize(value):
+    return rera_clean_text(value).lower()
+
+
+def rera_safe_filename(value):
+    value = rera_clean_text(value)
+
+    value = re.sub(
+        r'[<>:"/\\|?*\x00-\x1F]+',
+        "_",
+        value,
+    )
+
+    value = re.sub(r"\s+", "_", value).strip("._")
+
+    return (value or "RERA_PROJECT")[:120]
+
+
+# =========================================================
+# BROWSER
+# =========================================================
+
+def create_rera_browser(headless=True):
+    playwright = sync_playwright().start()
+
+    browser = playwright.chromium.launch(
+        headless=bool(headless),
+        slow_mo=100,
+        args=[
+            "--disable-features=Translate",
+            "--disable-translate",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--start-maximized",
+        ],
+    )
+
+    context = browser.new_context(
+        locale="en-IN",
+        viewport={
+            "width": 1800,
+            "height": 1100,
+        },
+        ignore_https_errors=True,
+        accept_downloads=True,
+    )
+
+    return playwright, browser, context
+
+
+def open_rera_portal(context, cancel_event=None):
+    last_error = None
+
+    for attempt in range(1, 4):
+        rera_raise_if_cancelled(cancel_event)
+        page = context.new_page()
+
+        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(60000)
+
+        try:
+            page.goto(
+                RERA_URL,
+                wait_until="commit",
+                timeout=45000,
+            )
+
+            selector = ".dataTables_filter input, input[type='search'], table"
+            for _ in range(24):
+                rera_raise_if_cancelled(cancel_event)
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+            else:
+                raise RuntimeError("RERA portal search controls did not load.")
+
+            page.wait_for_timeout(2500)
+
+            return page
+
+        except Exception as error:
+            last_error = error
+
+            try:
+                page.close()
+            except Exception:
+                pass
+
+            time.sleep(attempt * 2)
+
+    raise RuntimeError(
+        f"Unable to open Karnataka RERA portal: {last_error}"
+    )
+
+
+# =========================================================
+# SEARCH FIELD
+# =========================================================
+
+def find_rera_search_input(page):
+    selectors = [
+        ".dataTables_filter input:visible",
+        "input[type='search']:visible",
+        "input[placeholder*='Search' i]:visible",
+        "input[aria-label*='Search' i]:visible",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+
+        for index in range(locator.count()):
+            item = locator.nth(index)
+
+            try:
+                if item.is_visible() and item.is_enabled():
+                    return item
+
+            except Exception:
+                continue
+
+    raise RuntimeError("RERA search field was not found.")
+
+
+def fill_rera_search(page, value):
+    search_input = find_rera_search_input(page)
+
+    search_input.scroll_into_view_if_needed()
+
+    search_input.fill("")
+    search_input.fill(value)
+
+    search_input.evaluate(
+        """
+        element => {
+            element.dispatchEvent(
+                new Event("input", {bubbles: true})
+            );
+
+            element.dispatchEvent(
+                new KeyboardEvent("keyup", {bubbles: true})
+            );
+
+            element.dispatchEvent(
+                new Event("change", {bubbles: true})
+            );
+        }
+        """
+    )
+
+    page.wait_for_timeout(2500)
+
+
+# =========================================================
+# READ PROJECT TABLE
+# =========================================================
+
+def read_rera_table(page):
+    return page.evaluate(
+        r"""
+        () => {
+            const clean = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+            const visible = element => {
+                if (!element) return false;
+
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden"
+                );
+            };
+
+            const tables = Array.from(
+                document.querySelectorAll("table")
+            ).filter(visible);
+
+            const table = tables.find(candidate => {
+                const headers = Array.from(
+                    candidate.querySelectorAll(
+                        "thead th, tr:first-child th"
+                    )
+                ).map(th =>
+                    clean(th.innerText || th.textContent).toLowerCase()
+                );
+
+                return (
+                    headers.some(h => h.includes("promoter")) &&
+                    headers.some(h => h.includes("project"))
+                );
+            });
+
+            if (!table) {
+                return {
+                    headers: [],
+                    rows: []
+                };
+            }
+
+            let headers = Array.from(
+                table.querySelectorAll("thead th")
+            ).map(th => clean(th.innerText || th.textContent));
+
+            if (!headers.length) {
+                headers = Array.from(
+                    table.querySelectorAll("tr:first-child th")
+                ).map(th => clean(th.innerText || th.textContent));
+            }
+
+            const rows = Array.from(
+                table.querySelectorAll("tbody tr")
+            )
+                .filter(visible)
+                .map((row, index) => ({
+                    index,
+                    values: Array.from(
+                        row.querySelectorAll("td")
+                    ).map(td =>
+                        clean(td.innerText || td.textContent)
+                    )
+                }))
+                .filter(row => row.values.some(Boolean));
+
+            return {
+                headers,
+                rows
+            };
+        }
+        """
+    )
+
+
+def header_index(headers, condition):
+    for index, header in enumerate(headers):
+        if condition(rera_normalize(header)):
+            return index
+
+    return -1
+
+
+def table_to_projects(table_data):
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+
+    registration_index = header_index(
+        headers,
+        lambda h: "registration" in h,
+    )
+
+    promoter_index = header_index(
+        headers,
+        lambda h: "promoter" in h,
+    )
+
+    project_index = header_index(
+        headers,
+        lambda h: (
+            "project" in h
+            and "view" not in h
+            and "detail" not in h
+        ),
+    )
+
+    type_index = header_index(
+        headers,
+        lambda h: h == "type" or "project type" in h,
+    )
+
+    district_index = header_index(
+        headers,
+        lambda h: "district" in h,
+    )
+
+    taluk_index = header_index(
+        headers,
+        lambda h: "taluk" in h,
+    )
+
+    completion_index = header_index(
+        headers,
+        lambda h: "completion" in h,
+    )
+
+    projects = []
+
+    for row in rows:
+        values = row.get("values", [])
+
+        def value_at(index):
+            if index >= 0 and index < len(values):
+                return values[index]
+            return ""
+
+        registration_number = value_at(registration_index)
+
+        if not registration_number:
+            registration_number = next(
+                (
+                    value
+                    for value in values
+                    if "PRM/KA/RERA" in value.upper()
+                ),
+                "",
+            )
+
+        projects.append(
+            {
+                "registration_number": registration_number,
+                "promoter_name": value_at(promoter_index),
+                "project_name": value_at(project_index),
+                "project_type": value_at(type_index),
+                "district": value_at(district_index),
+                "taluk": value_at(taluk_index),
+                "proposed_completion_date": value_at(completion_index),
+            }
+        )
+
+    return projects
+
+
+def rera_next_button(page):
+    selectors = [
+        "a.paginate_button.next:not(.disabled):visible",
+        "li.next:not(.disabled) a:visible",
+        "button:has-text('Next'):not([disabled]):visible",
+        "a:has-text('Next'):visible",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+
+        for index in range(locator.count()):
+            item = locator.nth(index)
+
+            try:
+                classes = (
+                    item.get_attribute("class") or ""
+                ).lower()
+
+                aria_disabled = (
+                    item.get_attribute("aria-disabled") or ""
+                ).lower()
+
+                if (
+                    item.is_visible()
+                    and "disabled" not in classes
+                    and aria_disabled != "true"
+                ):
+                    return item
+
+            except Exception:
+                continue
+
+    return None
+
+
+# =========================================================
+# SEARCH RERA PROJECTS
+# =========================================================
+
+def search_rera_projects(data):
+    search_type = rera_normalize(data.get("searchType", ""))
+    query = rera_clean_text(data.get("query", ""))
+
+    try:
+        max_pages = int(data.get("maxPages", 25))
+    except Exception:
+        max_pages = 25
+
+    try:
+        max_results = int(data.get("maxResults", 500))
+    except Exception:
+        max_results = 500
+
+    max_pages = max(1, min(max_pages, 100))
+    max_results = max(1, min(max_results, 5000))
+
+    if search_type not in {"promoter", "project", "registration"}:
+        raise RuntimeError(
+            "searchType must be promoter, project, or registration."
+        )
+
+    if len(query) < 2:
+        raise RuntimeError(
+            "Enter at least two characters."
+        )
+
+    playwright = None
+    browser = None
+    context = None
+    request_id = data.get("requestId", "")
+    cancel_event = rera_cancel_event(request_id)
+
+    try:
+        playwright, browser, context = create_rera_browser(
+            headless=data.get("headless", True)
+        )
+
+        page = open_rera_portal(context, cancel_event)
+
+        fill_rera_search(page, query)
+
+        results = []
+        seen = set()
+
+        normalized_query = rera_normalize(query)
+
+        for _ in range(max_pages):
+            rera_raise_if_cancelled(cancel_event)
+            table_data = read_rera_table(page)
+            projects = table_to_projects(table_data)
+
+            for project in projects:
+                if search_type == "promoter":
+                    searched_value = project.get(
+                        "promoter_name",
+                        "",
+                    )
+                elif search_type == "project":
+                    searched_value = project.get(
+                        "project_name",
+                        "",
+                    )
+                else:
+                    searched_value = project.get(
+                        "registration_number",
+                        "",
+                    )
+
+                if normalized_query not in rera_normalize(searched_value):
+                    continue
+
+                unique_key = "|".join(
+                    [
+                        rera_normalize(
+                            project.get("registration_number", "")
+                        ),
+                        rera_normalize(
+                            project.get("project_name", "")
+                        ),
+                        rera_normalize(
+                            project.get("promoter_name", "")
+                        ),
+                    ]
+                )
+
+                if unique_key in seen:
+                    continue
+
+                seen.add(unique_key)
+                results.append(project)
+
+                if len(results) >= max_results:
+                    break
+
+            if len(results) >= max_results:
+                break
+
+            next_button = rera_next_button(page)
+
+            if next_button is None:
+                break
+
+            previous_first_row = json.dumps(
+                table_data.get("rows", [])[:1],
+                ensure_ascii=False,
+            )
+
+            next_button.click(force=True)
+            page.wait_for_timeout(1200)
+
+            current_table = read_rera_table(page)
+
+            current_first_row = json.dumps(
+                current_table.get("rows", [])[:1],
+                ensure_ascii=False,
+            )
+
+            if current_first_row == previous_first_row:
+                break
+
+        return {
+            "success": True,
+            "type": "RERA_PROJECT_SEARCH",
+            "searchType": search_type,
+            "query": query,
+            "count": len(results),
+            "results": results,
+        }
+
+    except Exception as error:
+        raise RuntimeError(
+            f"RERA search failed: {error}"
+        ) from error
+
+    finally:
+        if request_id:
+            with RERA_CANCEL_LOCK:
+                RERA_CANCEL_EVENTS.pop(request_id, None)
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+# =========================================================
+# MARK VIEW PROJECT DETAILS ICON
+# =========================================================
+
+def mark_rera_details_icon(
+    page,
+    registration_number,
+    project_name,
+    promoter_name,
+):
+    return page.evaluate(
+        r"""
+        ({
+            registrationNumber,
+            projectName,
+            promoterName
+        }) => {
+            const normalize = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+            const visible = element => {
+                if (!element) return false;
+
+                const rect = element.getBoundingClientRect();
+                const style = window.getComputedStyle(element);
+
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden"
+                );
+            };
+
+            const tables = Array.from(
+                document.querySelectorAll("table")
+            ).filter(visible);
+
+            const table = tables.find(candidate => {
+                const headers = Array.from(
+                    candidate.querySelectorAll(
+                        "thead th, tr:first-child th"
+                    )
+                ).map(header =>
+                    normalize(header.innerText || header.textContent)
+                );
+
+                return (
+                    headers.some(h => h.includes("promoter")) &&
+                    headers.some(h => h.includes("project"))
+                );
+            });
+
+            if (!table) {
+                return {
+                    success: false,
+                    reason: "RERA project table not found."
+                };
+            }
+
+            let headers = Array.from(
+                table.querySelectorAll("thead th")
+            ).map(header =>
+                normalize(header.innerText || header.textContent)
+            );
+
+            if (!headers.length) {
+                headers = Array.from(
+                    table.querySelectorAll("tr:first-child th")
+                ).map(header =>
+                    normalize(header.innerText || header.textContent)
+                );
+            }
+
+            const registrationIndex = headers.findIndex(
+                h => h.includes("registration")
+            );
+
+            const promoterIndex = headers.findIndex(
+                h => h.includes("promoter")
+            );
+
+            const projectIndex = headers.findIndex(
+                h =>
+                    h.includes("project") &&
+                    !h.includes("view") &&
+                    !h.includes("detail")
+            );
+
+            let detailsIndex = headers.findIndex(
+                h =>
+                    h.includes("view project details") ||
+                    (
+                        h.includes("view") &&
+                        h.includes("project")
+                    )
+            );
+
+            const wantedRegistration = normalize(registrationNumber);
+            const wantedProject = normalize(projectName);
+            const wantedPromoter = normalize(promoterName);
+
+            const rows = Array.from(
+                table.querySelectorAll("tbody tr")
+            ).filter(visible);
+
+            let matchedRow = null;
+
+            for (const row of rows) {
+                const cells = Array.from(
+                    row.querySelectorAll("td")
+                );
+
+                if (!cells.length) {
+                    continue;
+                }
+
+                const values = cells.map(cell =>
+                    normalize(cell.innerText || cell.textContent)
+                );
+
+                const registrationValue =
+                    registrationIndex >= 0
+                        ? values[registrationIndex]
+                        : (
+                            values.find(
+                                value => value.includes("prm/ka/rera")
+                            ) || ""
+                        );
+
+                const projectValue =
+                    projectIndex >= 0
+                        ? values[projectIndex]
+                        : "";
+
+                const promoterValue =
+                    promoterIndex >= 0
+                        ? values[promoterIndex]
+                        : "";
+
+                const registrationMatches =
+                    wantedRegistration &&
+                    (
+                        registrationValue === wantedRegistration ||
+                        registrationValue.includes(wantedRegistration) ||
+                        wantedRegistration.includes(registrationValue)
+                    );
+
+                const namesMatch =
+                    wantedProject &&
+                    projectValue.includes(wantedProject) &&
+                    (
+                        !wantedPromoter ||
+                        promoterValue.includes(wantedPromoter)
+                    );
+
+                if (
+                    registrationMatches ||
+                    (
+                        !wantedRegistration &&
+                        namesMatch
+                    )
+                ) {
+                    matchedRow = row;
+                    break;
+                }
+            }
+
+            if (!matchedRow) {
+                return {
+                    success: false,
+                    reason: "Selected project row was not found."
+                };
+            }
+
+            const cells = Array.from(
+                matchedRow.querySelectorAll("td")
+            );
+
+            if (
+                detailsIndex < 0 &&
+                projectIndex >= 0
+            ) {
+                detailsIndex = projectIndex + 1;
+            }
+
+            if (
+                detailsIndex < 0 ||
+                detailsIndex >= cells.length
+            ) {
+                detailsIndex = cells.findIndex(
+                    cell =>
+                        Boolean(
+                            cell.querySelector(
+                                "a, button, input, [onclick], " +
+                                "[role='button'], img, svg, i"
+                            )
+                        )
+                );
+            }
+
+            if (
+                detailsIndex < 0 ||
+                detailsIndex >= cells.length
+            ) {
+                return {
+                    success: false,
+                    reason: "View Project Details column not found."
+                };
+            }
+
+            const detailsCell = cells[detailsIndex];
+
+            const icon = detailsCell.querySelector(
+                "img, svg, i, span"
+            );
+
+            const target =
+                detailsCell.querySelector(
+                    "a[href], button, input[type='button'], " +
+                    "input[type='submit'], [role='button'], [onclick]"
+                ) ||
+                (
+                    icon &&
+                    (
+                        icon.closest(
+                            "a, button, [role='button'], [onclick]"
+                        ) ||
+                        icon
+                    )
+                ) ||
+                detailsCell;
+
+            document.querySelectorAll(
+                "[data-rera-details-target]"
+            ).forEach(element =>
+                element.removeAttribute(
+                    "data-rera-details-target"
+                )
+            );
+
+            target.setAttribute(
+                "data-rera-details-target",
+                "true"
+            );
+
+            target.scrollIntoView({
+                block: "center",
+                inline: "center"
+            });
+
+            return {
+                success: true
+            };
+        }
+        """,
+        {
+            "registrationNumber": registration_number,
+            "projectName": project_name,
+            "promoterName": promoter_name,
+        },
+    )
+
+
+# =========================================================
+# WAIT FOR DETAILS PAGE
+# =========================================================
+
+def rera_page_score(page):
+    if page is None or page.is_closed():
+        return 0
+
+    try:
+        text = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        return 0
+
+    text = rera_normalize(text)
+
+    markers = [
+        "project registration details",
+        "promoter details",
+        "authorized signatory",
+        "project details",
+        "land details",
+        "land survey details",
+        "bank details",
+        "uploaded documents",
+    ]
+
+    return (
+        sum(100 for marker in markers if marker in text)
+        + min(len(text), 50000) // 100
+    )
+
+
+def wait_for_rera_details_page(
+    context,
+    source_page,
+    pages_before,
+    timeout=60,
+):
+    deadline = time.time() + timeout
+
+    best_page = None
+    best_score = 0
+
+    while time.time() < deadline:
+        candidates = [
+            source_page,
+            *[
+                page
+                for page in context.pages
+                if page not in pages_before
+            ],
+        ]
+
+        for candidate in candidates:
+            if candidate.is_closed():
+                continue
+
+            score = rera_page_score(candidate)
+
+            if score > best_score:
+                best_score = score
+                best_page = candidate
+
+            if score >= 300:
+                return candidate
+
+        source_page.wait_for_timeout(350)
+
+    if best_page is not None and best_score >= 250:
+        return best_page
+
+    raise RuntimeError(
+        "Project Registration Details did not open."
+    )
+
+
+def wait_for_page_stable(page, timeout=30):
+    deadline = time.time() + timeout
+
+    previous = None
+    stable_count = 0
+
+    while time.time() < deadline:
+        try:
+            current = page.evaluate(
+                """
+                () => ({
+                    textLength:
+                        (document.body.innerText || "").length,
+
+                    height:
+                        Math.max(
+                            document.body.scrollHeight,
+                            document.documentElement.scrollHeight
+                        ),
+
+                    images:
+                        Array.from(document.images)
+                            .filter(img => img.complete)
+                            .length,
+
+                    totalImages:
+                        document.images.length
+                })
+                """
+            )
+        except Exception:
+            page.wait_for_timeout(500)
+            continue
+
+        if current == previous and current["textLength"] > 800:
+            stable_count += 1
+
+            if stable_count >= 3:
+                return
+
+        else:
+            stable_count = 0
+
+        previous = current
+
+        page.wait_for_timeout(500)
+
+
+# =========================================================
+# PRINT BUTTON
+# =========================================================
+
+def install_print_interceptor(page):
+    page.evaluate(
+        """
+        () => {
+            window.__reraPrintRequested = false;
+
+            try {
+                Object.defineProperty(
+                    window,
+                    "print",
+                    {
+                        configurable: true,
+                        writable: true,
+                        value: () => {
+                            window.__reraPrintRequested = true;
+                        }
+                    }
+                );
+            } catch (error) {
+                window.print = () => {
+                    window.__reraPrintRequested = true;
+                };
+            }
+        }
+        """
+    )
+
+
+def find_rera_print_button(page):
+    selectors = [
+        "button:has-text('Print'):visible",
+        "a:has-text('Print'):visible",
+        "input[value*='Print' i]:visible",
+        "[onclick*='print' i]:visible",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+
+        for index in range(locator.count()):
+            item = locator.nth(index)
+
+            try:
+                if item.is_visible():
+                    return item
+            except Exception:
+                continue
+
+    raise RuntimeError(
+        "Print button beside Project Registration Details was not found."
+    )
+
+
+# =========================================================
+# CLONE ONLY PROJECT DETAILS
+# =========================================================
+
+def serialize_project_details(page):
+    return page.evaluate(
+        r"""
+        async () => {
+            const normalize = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+            window.dispatchEvent(new Event("beforeprint"));
+            document.dispatchEvent(new Event("beforeprint"));
+
+            const heading = Array.from(
+                document.querySelectorAll(
+                    "h1, h2, h3, h4, h5, div, span"
+                )
+            ).find(element =>
+                normalize(
+                    element.innerText ||
+                    element.textContent
+                ) === "project registration details"
+            );
+
+            if (!heading) {
+                throw new Error(
+                    "Project Registration Details heading not found."
+                );
+            }
+
+            let root = heading.closest(
+                ".modal, [role='dialog']"
+            );
+
+            if (!root) {
+                let current = heading.parentElement;
+
+                while (
+                    current &&
+                    current !== document.body
+                ) {
+                    const text = normalize(
+                        current.innerText ||
+                        current.textContent
+                    );
+
+                    const count = [
+                        "project registration details",
+                        "promoter details",
+                        "project details",
+                        "authorized signatory",
+                        "land details",
+                        "uploaded documents"
+                    ].filter(marker =>
+                        text.includes(marker)
+                    ).length;
+
+                    if (count >= 3 && text.length > 1000) {
+                        root = current;
+                        break;
+                    }
+
+                    current = current.parentElement;
+                }
+            }
+
+            if (!root) {
+                root = document.body;
+            }
+
+            root.querySelectorAll("canvas").forEach(canvas => {
+                try {
+                    const img = document.createElement("img");
+                    img.src = canvas.toDataURL("image/png");
+                    img.style.cssText = canvas.style.cssText;
+                    img.width = canvas.width;
+                    img.height = canvas.height;
+                    canvas.replaceWith(img);
+                } catch (error) {}
+            });
+
+            root.querySelectorAll("[src]").forEach(element => {
+                try {
+                    element.setAttribute("src", element.src);
+                } catch (error) {}
+            });
+
+            root.querySelectorAll("a[href]").forEach(element => {
+                try {
+                    element.setAttribute("href", element.href);
+                } catch (error) {}
+            });
+
+            root.querySelectorAll(
+                ".tab-pane, .collapse, .accordion-collapse, " +
+                ".panel-collapse, [hidden]"
+            ).forEach(element => {
+                element.hidden = false;
+                element.removeAttribute("aria-hidden");
+
+                element.style.setProperty(
+                    "display",
+                    "block",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "visibility",
+                    "visible",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "opacity",
+                    "1",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "height",
+                    "auto",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "max-height",
+                    "none",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "overflow",
+                    "visible",
+                    "important"
+                );
+            });
+
+            root.setAttribute(
+                "data-rera-export-root",
+                "true"
+            );
+
+            const styleAssets = [
+                ...Array.from(
+                    document.querySelectorAll("link[rel='stylesheet']")
+                ).map(link =>
+                    `<link rel="stylesheet" href="${link.href}" media="all">`
+                ),
+
+                ...Array.from(
+                    document.querySelectorAll("style")
+                ).map(style => style.outerHTML)
+            ].join("\\n");
+
+            return {
+                baseUrl: location.href,
+                title: document.title || "RERA Project Details",
+                bodyClass: document.body.className || "",
+                styleAssets,
+                rootHtml: root.outerHTML
+            };
+        }
+        """
+    )
+
+
+def create_clean_rera_pdf_page(context, details_page):
+    data = serialize_project_details(details_page)
+
+    export_page = context.new_page()
+    export_page.set_default_timeout(60000)
+
+    html = f"""
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <base href="{data['baseUrl']}">
+        <title>{data['title']}</title>
+
+        {data['styleAssets']}
+
+        <style>
+            @page {{
+                size: A4 portrait;
+                margin: 10mm 7mm 12mm 7mm;
+            }}
+
+            html,
+            body {{
+                margin: 0 !important;
+                padding: 0 !important;
+                background: white !important;
+                width: auto !important;
+                height: auto !important;
+                overflow: visible !important;
+            }}
+
+            [data-rera-export-root],
+            [data-rera-export-root] .modal-dialog,
+            [data-rera-export-root] .modal-content,
+            [data-rera-export-root] .modal-body {{
+                display: block !important;
+                position: static !important;
+                inset: auto !important;
+                float: none !important;
+                transform: none !important;
+                opacity: 1 !important;
+                visibility: visible !important;
+                width: 100% !important;
+                max-width: none !important;
+                height: auto !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                box-shadow: none !important;
+                background: white !important;
+            }}
+
+            [data-rera-export-root] .tab-pane,
+            [data-rera-export-root] .collapse,
+            [data-rera-export-root] .accordion-collapse,
+            [data-rera-export-root] .panel-collapse {{
+                display: block !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                height: auto !important;
+                max-height: none !important;
+                overflow: visible !important;
+            }}
+
+            [data-rera-export-root] button,
+            [data-rera-export-root] input[type="button"],
+            [data-rera-export-root] input[type="submit"],
+            [data-rera-export-root] .close,
+            [data-rera-export-root] .nav-tabs,
+            [data-rera-export-root] .dataTables_filter,
+            [data-rera-export-root] .dataTables_paginate,
+            [data-rera-export-root] .dataTables_info {{
+                display: none !important;
+            }}
+
+            * {{
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+                box-sizing: border-box;
+            }}
+
+            table {{
+                border-collapse: collapse !important;
+                width: 100% !important;
+            }}
+
+            thead {{
+                display: table-header-group !important;
+            }}
+
+            tfoot {{
+                display: table-footer-group !important;
+            }}
+
+            tr,
+            img,
+            .panel,
+            .card {{
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }}
+
+            img {{
+                max-width: 100% !important;
+                height: auto !important;
+            }}
+        </style>
+    </head>
+    <body class="{data['bodyClass']}">
+        {data['rootHtml']}
+    </body>
+    </html>
+    """
+
+    export_page.set_content(
+        html,
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+
+    try:
+        export_page.wait_for_load_state(
+            "networkidle",
+            timeout=30000,
+        )
+    except Exception:
+        pass
+
+    export_page.evaluate(
+        """
+        async () => {
+            if (document.fonts && document.fonts.ready) {
+                await document.fonts.ready;
+            }
+
+            await Promise.all(
+                Array.from(document.images).map(image => {
+                    if (image.complete) {
+                        return Promise.resolve();
+                    }
+
+                    return new Promise(resolve => {
+                        image.addEventListener(
+                            "load",
+                            resolve,
+                            {once: true}
+                        );
+
+                        image.addEventListener(
+                            "error",
+                            resolve,
+                            {once: true}
+                        );
+
+                        setTimeout(resolve, 10000);
+                    });
+                })
+            );
+        }
+        """
+    )
+
+    export_page.emulate_media(media="print")
+    export_page.wait_for_timeout(1000)
+
+    return export_page
+
+
+def save_rera_pdf(export_page, output_path):
+    export_page.pdf(
+        path=output_path,
+        format="A4",
+        landscape=False,
+        print_background=True,
+        prefer_css_page_size=False,
+        scale=0.88,
+        margin={
+            "top": "10mm",
+            "right": "7mm",
+            "bottom": "12mm",
+            "left": "7mm",
+        },
+        display_header_footer=True,
+        header_template=(
+            "<div style='width:100%;font-size:8px;"
+            "padding:0 8mm;text-align:center;'>"
+            "RERA Project Details"
+            "</div>"
+        ),
+        footer_template=(
+            "<div style='width:100%;font-size:8px;padding:0 8mm;'>"
+            "<span class='url'></span>"
+            "<span style='float:right'>"
+            "<span class='pageNumber'></span>/"
+            "<span class='totalPages'></span>"
+            "</span>"
+            "</div>"
+        ),
+    )
+
+    if (
+        not os.path.isfile(output_path)
+        or os.path.getsize(output_path) < 30000
+    ):
+        raise RuntimeError(
+            "Generated RERA PDF is blank or incomplete."
+        )
+
+
+# =========================================================
+# CREATE PDF
+# =========================================================
+
+def create_rera_project_pdf(data):
+    registration_number = rera_clean_text(
+        data.get("registrationNumber", "")
+    )
+
+    project_name = rera_clean_text(
+        data.get("projectName", "")
+    )
+
+    promoter_name = rera_clean_text(
+        data.get("promoterName", "")
+    )
+
+    if not registration_number and not project_name:
+        raise RuntimeError(
+            "registrationNumber or projectName is required."
+        )
+
+    playwright = None
+    browser = None
+    context = None
+    active_page = None
+
+    try:
+        playwright, browser, context = create_rera_browser(
+            headless=data.get("headless", True)
+        )
+
+        list_page = open_rera_portal(context)
+        active_page = list_page
+
+        fill_rera_search(
+            list_page,
+            registration_number or project_name,
+        )
+
+        marked = mark_rera_details_icon(
+            list_page,
+            registration_number,
+            project_name,
+            promoter_name,
+        )
+
+        if not marked.get("success") and project_name:
+            fill_rera_search(list_page, project_name)
+
+            marked = mark_rera_details_icon(
+                list_page,
+                registration_number,
+                project_name,
+                promoter_name,
+            )
+
+        if not marked.get("success"):
+            raise RuntimeError(
+                marked.get("reason")
+                or "View Project Details icon not found."
+            )
+
+        pages_before = list(context.pages)
+
+        target = list_page.locator(
+            "[data-rera-details-target='true']"
+        ).first
+
+        target.wait_for(
+            state="visible",
+            timeout=30000,
+        )
+
+        target.click(
+            force=True,
+            no_wait_after=True,
+        )
+
+        details_page = wait_for_rera_details_page(
+            context,
+            list_page,
+            pages_before,
+        )
+
+        active_page = details_page
+
+        wait_for_page_stable(details_page)
+
+        install_print_interceptor(details_page)
+
+        print_button = find_rera_print_button(details_page)
+
+        print_button.scroll_into_view_if_needed()
+
+        print_button.click(
+            force=True,
+            no_wait_after=True,
+        )
+
+        details_page.wait_for_timeout(1000)
+
+        details_page.evaluate(
+            """
+            () => {
+                window.dispatchEvent(new Event("beforeprint"));
+                document.dispatchEvent(new Event("beforeprint"));
+            }
+            """
+        )
+
+        details_page.wait_for_timeout(800)
+
+        export_page = create_clean_rera_pdf_page(
+            context,
+            details_page,
+        )
+
+        active_page = export_page
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        filename = (
+            f"RERA_"
+            f"{rera_safe_filename(project_name or registration_number)}_"
+            f"{rera_safe_filename(registration_number or 'PROJECT')}_"
+            f"{timestamp}.pdf"
+        )
+
+        output_path = os.path.join(
+            RERA_DOWNLOAD_DIR,
+            filename,
+        )
+
+        save_rera_pdf(
+            export_page,
+            output_path,
+        )
+
+        return {
+            "success": True,
+            "filename": filename,
+            "pdf": output_path,
+            "downloadUrl": f"/api/rera/download/{filename}",
+        }
+
+    except Exception as error:
+        debug_id = int(time.time())
+
+        try:
+            if active_page is not None and not active_page.is_closed():
+                screenshot_path = os.path.join(
+                    RERA_DEBUG_DIR,
+                    f"rera-{debug_id}.png",
+                )
+
+                html_path = os.path.join(
+                    RERA_DEBUG_DIR,
+                    f"rera-{debug_id}.html",
+                )
+
+                active_page.screenshot(
+                    path=screenshot_path,
+                    full_page=True,
+                )
+
+                with open(html_path, "w", encoding="utf-8") as file:
+                    file.write(active_page.content())
+
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"RERA PDF creation failed: {error}"
+        ) from error
+
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+RERA_DOCUMENT_KEYWORDS = [
+    "registration certificate",
+    "promoter",
+    "company",
+    "partnership",
+    "pan",
+    "gst",
+    "balance sheet",
+    "profit",
+    "loss",
+    "audit",
+    "title deed",
+    "title",
+    "ownership",
+    "land owner",
+    "landowner",
+    "sale deed",
+    "rtc",
+    "encumbrance",
+    "ec",
+    "khata",
+    "conversion",
+    "section 95",
+    "development agreement",
+    "jda",
+    "joint development",
+    "affidavit",
+    "declaration",
+    "approved plan",
+    "building plan",
+    "plotting plan",
+    "layout plan",
+    "existing layout",
+    "commencement certificate",
+    "floor plan",
+    "section",
+    "elevation",
+    "drawing",
+    "infrastructure",
+    "area development",
+    "ktcp",
+    "section 14",
+    "utilisation",
+    "utilization",
+    "tdr",
+    "transferable development",
+    "relinquishment",
+    "agreement for sale",
+    "allotment",
+    "conveyance",
+    "brochure",
+    "specification",
+    "fire noc",
+    "airport",
+    "bescom",
+    "bwssb",
+    "kspcb",
+    "seiaa",
+    "environment",
+    "noc",
+    "approval",
+    "photograph",
+    "photo",
+    "gallery",
+    "quarterly",
+    "completion",
+    "certificate",
+    "licence",
+    "license",
+    "download",
+    "annexure",
+]
+
+
+def rera_doc_safe_name(value):
+    value = rera_clean_text(value)
+
+    value = re.sub(
+        r'[<>:"/\\|?*\x00-\x1F]+',
+        "_",
+        value,
+    )
+
+    value = re.sub(
+        r"\s+",
+        "_",
+        value,
+    ).strip("._")
+
+    return (value or "document")[:140]
+
+
+def rera_doc_is_not_applicable(value):
+    text = rera_normalize(value)
+
+    return (
+        "not applicable" in text
+        or "not_applicable" in text
+        or "notapplicable" in text
+    )
+
+
+def rera_doc_extension_from_content_type(content_type):
+    content_type = (content_type or "").lower()
+
+    if "application/pdf" in content_type:
+        return ".pdf"
+
+    if "image/jpeg" in content_type:
+        return ".jpg"
+
+    if "image/png" in content_type:
+        return ".png"
+
+    if "image/webp" in content_type:
+        return ".webp"
+
+    if "wordprocessingml" in content_type:
+        return ".docx"
+
+    if "spreadsheet" in content_type:
+        return ".xlsx"
+
+    guessed = mimetypes.guess_extension(
+        content_type.split(";")[0].strip()
+    )
+
+    return guessed or ".bin"
+
+
+def rera_doc_guess_filename(label, url, content_type=""):
+    label = rera_clean_text(label)
+
+    if label:
+        filename = label
+
+    else:
+        filename = ""
+
+        if url:
+            try:
+                filename = os.path.basename(
+                    unquote(
+                        url.split("?")[0]
+                    )
+                )
+            except Exception:
+                filename = ""
+
+    filename = filename or "document"
+    filename = rera_doc_safe_name(filename)
+
+    root, ext = os.path.splitext(filename)
+
+    if not ext:
+        ext = rera_doc_extension_from_content_type(
+            content_type
+        )
+
+        filename = f"{root}{ext}"
+
+    return filename
+
+
+def rera_doc_body_looks_valid(body, content_type):
+    if not body or len(body) < 100:
+        return False
+
+    content_type = (content_type or "").lower()
+
+    if body.startswith(b"%PDF-"):
+        return True
+
+    if body.startswith(b"\x89PNG"):
+        return True
+
+    if body.startswith(b"\xff\xd8\xff"):
+        return True
+
+    if body.startswith(b"PK"):
+        return True
+
+    if (
+        "application/pdf" in content_type
+        or "image/" in content_type
+        or "wordprocessingml" in content_type
+        or "spreadsheet" in content_type
+        or "application/octet-stream" in content_type
+    ):
+        return True
+
+    if b"<html" in body[:500].lower():
+        return False
+
+    return True
+
+
+def rera_open_selected_project_details_for_documents(payload):
+    """
+    Opens completed projects page, searches selected project,
+    clicks View Project Details, and returns the open details page.
+    """
+
+    registration_number = rera_clean_text(
+        payload.get("registrationNumber", "")
+    )
+
+    project_name = rera_clean_text(
+        payload.get("projectName", "")
+    )
+
+    promoter_name = rera_clean_text(
+        payload.get("promoterName", "")
+    )
+
+    if not registration_number and not project_name:
+        raise RuntimeError(
+            "registrationNumber or projectName is required."
+        )
+
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright, browser, context = create_rera_browser(
+            headless=payload.get("headless", True)
+        )
+
+        list_page = open_rera_portal(context)
+
+        fill_rera_search(
+            list_page,
+            registration_number or project_name,
+        )
+
+        marked = mark_rera_details_icon(
+            list_page,
+            registration_number,
+            project_name,
+            promoter_name,
+        )
+
+        if not marked.get("success") and project_name:
+            fill_rera_search(
+                list_page,
+                project_name,
+            )
+
+            marked = mark_rera_details_icon(
+                list_page,
+                registration_number,
+                project_name,
+                promoter_name,
+            )
+
+        if not marked.get("success"):
+            raise RuntimeError(
+                marked.get("reason")
+                or "View Project Details icon not found."
+            )
+
+        pages_before = list(context.pages)
+
+        target = list_page.locator(
+            "[data-rera-details-target='true']"
+        ).first
+
+        target.wait_for(
+            state="visible",
+            timeout=30000,
+        )
+
+        target.click(
+            force=True,
+            no_wait_after=True,
+        )
+
+        details_page = wait_for_rera_details_page(
+            context,
+            list_page,
+            pages_before,
+        )
+
+        wait_for_page_stable(details_page)
+
+        return playwright, browser, context, details_page
+
+    except Exception:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+        raise
+
+
+def rera_open_all_project_tabs(page):
+    """
+    Clicks every tab in Project Registration Details so all links load.
+    """
+
+    tab_selectors = [
+        ".nav-tabs a",
+        "a[data-toggle='tab']",
+        "a[data-bs-toggle='tab']",
+        "button[data-bs-toggle='tab']",
+        "button[data-toggle='tab']",
+    ]
+
+    for selector in tab_selectors:
+        tabs = page.locator(selector)
+
+        for index in range(tabs.count()):
+            tab = tabs.nth(index)
+
+            try:
+                if tab.is_visible():
+                    tab.click(
+                        force=True,
+                        no_wait_after=True,
+                    )
+
+                    page.wait_for_timeout(350)
+
+            except Exception:
+                continue
+
+    page.evaluate(
+        """
+        () => {
+            // The ZIP workflow must never open Chromium's native print dialog,
+            // because that blocks Playwright until a user closes it.
+            window.print = () => {};
+
+            document.querySelectorAll(
+                ".tab-pane, .collapse, .accordion-collapse, " +
+                ".panel-collapse, [hidden]"
+            ).forEach(element => {
+                element.hidden = false;
+                element.removeAttribute("aria-hidden");
+
+                element.style.setProperty(
+                    "display",
+                    "block",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "visibility",
+                    "visible",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "opacity",
+                    "1",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "height",
+                    "auto",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "max-height",
+                    "none",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "overflow",
+                    "visible",
+                    "important"
+                );
+            });
+        }
+        """
+    )
+
+    page.wait_for_timeout(500)
+
+
+def rera_extract_all_download_candidates(page):
+    """
+    Extracts all possible downloadable files from all tabs.
+    Returns:
+    {
+        "candidates": downloadable documents,
+        "not_applicable": documents marked NOT APPLICABLE
+    }
+    """
+
+    rera_open_all_project_tabs(page)
+
+    result = page.evaluate(
+        r"""
+        () => {
+            const clean = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+            const normalize = value =>
+                clean(value).toLowerCase();
+
+            const sectionNameFor = element => {
+                const tabPane =
+                    element.closest(".tab-pane");
+
+                if (tabPane && tabPane.id) {
+                    return tabPane.id;
+                }
+
+                let current = element;
+
+                while (current && current !== document.body) {
+                    const heading = current.querySelector(
+                        "h1, h2, h3, h4, h5, .panel-title, legend"
+                    );
+
+                    if (heading) {
+                        return clean(
+                            heading.innerText ||
+                            heading.textContent
+                        );
+                    }
+
+                    current = current.parentElement;
+                }
+
+                return "Project Details";
+            };
+
+            const rowLabelFor = element => {
+                const row =
+                    element.closest("tr") ||
+                    element.closest(".row") ||
+                    element.parentElement;
+
+                if (row) {
+                    const rowText = clean(
+                        row.innerText ||
+                        row.textContent
+                    );
+
+                    if (rowText) {
+                        return rowText;
+                    }
+                }
+
+                return clean(
+                    element.innerText ||
+                    element.textContent ||
+                    element.value ||
+                    element.title ||
+                    element.alt ||
+                    element.getAttribute("aria-label") ||
+                    ""
+                );
+            };
+
+            const isVisibleOrUseful = element => {
+                if (!element) {
+                    return false;
+                }
+
+                const style =
+                    window.getComputedStyle(element);
+
+                const rect =
+                    element.getBoundingClientRect();
+
+                const html =
+                    element.outerHTML || "";
+
+                return (
+                    (
+                        style.display !== "none" &&
+                        style.visibility !== "hidden"
+                    ) ||
+                    html.toLowerCase().includes(".pdf") ||
+                    html.toLowerCase().includes("download") ||
+                    html.toLowerCase().includes("annexure") ||
+                    html.toLowerCase().includes("not applicable")
+                );
+            };
+
+            const heading = Array.from(
+                document.querySelectorAll(
+                    "h1, h2, h3, h4, h5, div, span"
+                )
+            ).find(element =>
+                normalize(
+                    element.innerText ||
+                    element.textContent
+                ) === "project registration details"
+            );
+
+            let root = null;
+
+            if (heading) {
+                root = heading.closest(
+                    ".modal, [role='dialog']"
+                );
+
+                if (!root) {
+                    let current =
+                        heading.parentElement;
+
+                    while (
+                        current &&
+                        current !== document.body
+                    ) {
+                        const text = normalize(
+                            current.innerText ||
+                            current.textContent
+                        );
+
+                        const count = [
+                            "project registration details",
+                            "promoter details",
+                            "land details",
+                            "project details",
+                            "bank details",
+                            "uploaded documents",
+                            "quarterly updates",
+                            "completion details"
+                        ].filter(marker =>
+                            text.includes(marker)
+                        ).length;
+
+                        if (
+                            count >= 3 &&
+                            text.length > 1000
+                        ) {
+                            root = current;
+                            break;
+                        }
+
+                        current =
+                            current.parentElement;
+                    }
+                }
+            }
+
+            if (!root) {
+                root = document.body;
+            }
+
+            const elements = Array.from(
+                root.querySelectorAll(
+                    "a[href], img[src], button, input[type='button'], " +
+                    "input[type='submit'], [onclick], embed[src], " +
+                    "iframe[src], object[data]"
+                )
+            ).filter(isVisibleOrUseful);
+
+            const candidates = [];
+            const notApplicable = [];
+
+            let counter = 0;
+
+            for (const element of elements) {
+                const tagName =
+                    element.tagName.toLowerCase();
+
+                const text = clean(
+                    element.innerText ||
+                    element.textContent ||
+                    element.value ||
+                    element.title ||
+                    element.alt ||
+                    element.getAttribute("aria-label") ||
+                    ""
+                );
+
+                const href =
+                    element.href ||
+                    element.src ||
+                    element.getAttribute("href") ||
+                    element.getAttribute("src") ||
+                    element.getAttribute("data") ||
+                    "";
+
+                const onclick =
+                    element.getAttribute("onclick") ||
+                    "";
+
+                const html =
+                    element.outerHTML || "";
+
+                const rowLabel =
+                    rowLabelFor(element);
+
+                const section =
+                    sectionNameFor(element);
+
+                const combined = normalize(
+                    [
+                        rowLabel,
+                        text,
+                        href,
+                        onclick,
+                        html
+                    ].join(" ")
+                );
+
+                const controlText = normalize(text);
+                const controlAction = normalize(
+                    [text, href, onclick].join(" ")
+                );
+
+                const isNotApplicable =
+                    combined.includes("not applicable") ||
+                    combined.includes("not_applicable") ||
+                    combined.includes("notapplicable");
+
+                if (isNotApplicable) {
+                    notApplicable.push({
+                        label:
+                            rowLabel || text || "NOT APPLICABLE",
+                        filename:
+                            text || "NOT APPLICABLE.pdf",
+                        section:
+                            section,
+                        reason:
+                            "Marked as NOT APPLICABLE in portal"
+                    });
+
+                    continue;
+                }
+
+                const hasFileExtension =
+                    /\.(pdf|jpg|jpeg|png|webp|doc|docx|xls|xlsx|zip)(\?|#|$)/i
+                        .test(
+                            href || text || onclick || html
+                        );
+
+                const looksLikeDocument =
+                    hasFileExtension ||
+                    combined.includes(".pdf") ||
+                    combined.includes("annexure") ||
+                    combined.includes("certificate") ||
+                    combined.includes("pancard") ||
+                    combined.includes("pan card") ||
+                    combined.includes("title") ||
+                    combined.includes("sale deed") ||
+                    combined.includes("rtc") ||
+                    combined.includes("encumbrance") ||
+                    combined.includes("khata") ||
+                    combined.includes("conversion") ||
+                    combined.includes("agreement") ||
+                    combined.includes("affidavit") ||
+                    combined.includes("plan") ||
+                    combined.includes("drawing") ||
+                    combined.includes("section") ||
+                    combined.includes("elevation") ||
+                    combined.includes("commencement") ||
+                    combined.includes("noc") ||
+                    combined.includes("approval") ||
+                    combined.includes("licence") ||
+                    combined.includes("license") ||
+                    combined.includes("utilisation") ||
+                    combined.includes("brochure") ||
+                    combined.includes("specification") ||
+                    combined.includes("photograph") ||
+                    combined.includes("gallery") ||
+                    combined.includes("quarterly") ||
+                    combined.includes("completion") ||
+                    combined.includes("download");
+
+                const ignoreUi =
+                    controlText === "print" ||
+                    controlText.startsWith("print ") ||
+                    controlText === "close" ||
+                    controlText === "next" ||
+                    controlText === "previous" ||
+                    controlAction.includes("window.print") ||
+                    controlAction.includes("print()") ||
+                    controlAction.includes("printpage") ||
+                    controlAction.includes("print page") ||
+                    (
+                        controlAction.includes("javascript:void(0)") &&
+                        !looksLikeDocument
+                    );
+
+                if (
+                    !looksLikeDocument ||
+                    ignoreUi
+                ) {
+                    continue;
+                }
+
+                const absoluteUrl = href
+                    ? new URL(href, location.href).href
+                    : "";
+
+                let filename = text;
+
+                if (!filename && absoluteUrl) {
+                    try {
+                        filename = decodeURIComponent(
+                            absoluteUrl
+                                .split("?")[0]
+                                .split("/")
+                                .pop()
+                        );
+                    } catch (error) {
+                        filename =
+                            absoluteUrl
+                                .split("?")[0]
+                                .split("/")
+                                .pop();
+                    }
+                }
+
+                filename =
+                    filename || text || "document";
+
+                const id =
+                    "rera_doc_" + counter;
+
+                element.setAttribute(
+                    "data-rera-download-id",
+                    id
+                );
+
+                candidates.push({
+                    id,
+                    tag: tagName,
+                    label: rowLabel || text || filename,
+                    filename,
+                    section,
+                    url: absoluteUrl,
+                    hasDirectUrl:
+                        Boolean(
+                            absoluteUrl &&
+                            !absoluteUrl
+                                .toLowerCase()
+                                .startsWith("javascript:")
+                        ),
+                    hasOnClick:
+                        Boolean(onclick)
+                });
+
+                counter += 1;
+            }
+
+            return {
+                candidates,
+                not_applicable: notApplicable
+            };
+        }
+        """
+    )
+
+    candidates = result.get("candidates", [])
+    not_applicable = result.get("not_applicable", [])
+
+    final_candidates = []
+    final_not_applicable = []
+
+    seen_candidates = set()
+    seen_not_applicable = set()
+
+    for index, item in enumerate(candidates):
+        label = rera_clean_text(item.get("label", ""))
+        filename = rera_clean_text(item.get("filename", ""))
+        section = rera_clean_text(item.get("section", "Project Details"))
+        url = rera_clean_text(item.get("url", ""))
+
+        key = "|".join(
+            [
+                rera_normalize(section),
+                rera_normalize(label),
+                rera_normalize(filename),
+                rera_normalize(url),
+            ]
+        )
+
+        if key in seen_candidates:
+            continue
+
+        seen_candidates.add(key)
+
+        final_candidates.append(
+            {
+                "id": item.get("id") or f"rera_doc_{index}",
+                "label": label or filename or f"Document {index + 1}",
+                "filename": filename or label or f"Document {index + 1}",
+                "section": section,
+                "url": url,
+                "hasDirectUrl": bool(item.get("hasDirectUrl")),
+                "hasOnClick": bool(item.get("hasOnClick")),
+            }
+        )
+
+    for index, item in enumerate(not_applicable):
+        label = rera_clean_text(item.get("label", ""))
+        filename = rera_clean_text(item.get("filename", "NOT APPLICABLE.pdf"))
+        section = rera_clean_text(item.get("section", "Project Details"))
+
+        key = "|".join(
+            [
+                rera_normalize(section),
+                rera_normalize(label),
+                rera_normalize(filename),
+            ]
+        )
+
+        if key in seen_not_applicable:
+            continue
+
+        seen_not_applicable.add(key)
+
+        final_not_applicable.append(
+            {
+                "label": label or f"Not Applicable Document {index + 1}",
+                "filename": filename or "NOT APPLICABLE.pdf",
+                "section": section,
+                "reason": "Marked as NOT APPLICABLE in RERA portal",
+            }
+        )
+
+    return {
+        "candidates": final_candidates,
+        "not_applicable": final_not_applicable,
+    }
+
+def rera_download_one_document(context, page, document):
+    """
+    Downloads document by direct URL first.
+    Falls back to clicking the original element.
+    """
+
+    url = document.get("url", "")
+    doc_id = document.get("id", "")
+    control_text = rera_normalize(
+        " ".join(
+            [
+                str(document.get("filename", "")),
+                str(document.get("url", "")),
+            ]
+        )
+    )
+
+    if (
+        control_text == "print"
+        or control_text.startswith("print ")
+        or "window.print" in control_text
+        or "print()" in control_text
+        or "printpage" in control_text
+    ):
+        raise RuntimeError("Skipped the RERA page Print control.")
+
+    if (
+        url
+        and not url.lower().startswith("javascript:")
+        and not url.endswith("#")
+    ):
+        try:
+            response = context.request.get(
+                url,
+                headers={
+                    "Referer": page.url,
+                },
+                timeout=20000,
+            )
+
+            body = response.body()
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            )
+
+            if (
+                response.ok
+                and rera_doc_body_looks_valid(
+                    body,
+                    content_type,
+                )
+            ):
+                return body, content_type
+
+        except Exception:
+            pass
+
+    if doc_id:
+        locator = page.locator(
+            f"[data-rera-download-id='{doc_id}']"
+        ).first
+
+        try:
+            if locator.count() == 0 or not locator.is_visible():
+                raise RuntimeError("Document link is no longer available.")
+        except Exception as error:
+            raise RuntimeError(
+                "Document link is no longer available."
+            ) from error
+
+        try:
+            with page.expect_download(
+                timeout=10000
+            ) as download_info:
+                locator.click(
+                    force=True,
+                    no_wait_after=True,
+                )
+
+            download = download_info.value
+            download_path = download.path()
+
+            with open(
+                download_path,
+                "rb",
+            ) as file:
+                body = file.read()
+
+            content_type = mimetypes.guess_type(
+                download.suggested_filename or ""
+            )[0] or ""
+
+            return body, content_type
+
+        except Exception:
+            pass
+
+        try:
+            pages_before = list(page.context.pages)
+
+            locator.click(
+                force=True,
+                no_wait_after=True,
+            )
+
+            page.wait_for_timeout(750)
+
+            new_pages = [
+                candidate
+                for candidate in page.context.pages
+                if candidate not in pages_before
+            ]
+
+            if new_pages:
+                popup = new_pages[-1]
+
+                try:
+                    popup.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
+
+                popup_url = popup.url
+
+                if popup_url:
+                    response = context.request.get(
+                        popup_url,
+                        headers={
+                            "Referer": page.url,
+                        },
+                        timeout=20000,
+                    )
+
+                    body = response.body()
+                    content_type = response.headers.get(
+                        "content-type",
+                        "",
+                    )
+
+                    if (
+                        response.ok
+                        and rera_doc_body_looks_valid(
+                            body,
+                            content_type,
+                        )
+                    ):
+                        try:
+                            popup.close()
+                        except Exception:
+                            pass
+
+                        return body, content_type
+
+                try:
+                    popup.close()
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Could not download document: "
+        f"{document.get('label') or document.get('filename')}"
+    )
+
+
+def rera_create_all_documents_zip(payload):
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright, browser, context, details_page = (
+            rera_open_selected_project_details_for_documents(
+                payload
+            )
+        )
+
+        extract_result = rera_extract_all_download_candidates(
+            details_page
+        )
+
+        if isinstance(extract_result, dict):
+            candidates = extract_result.get("candidates", [])
+            not_applicable_documents = extract_result.get("not_applicable", [])
+        else:
+            candidates = extract_result
+            not_applicable_documents = []
+
+        documents = candidates
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        project_name = (
+            payload.get("projectName")
+            or payload.get("registrationNumber")
+            or "RERA_PROJECT"
+        )
+
+        zip_filename = (
+            f"RERA_ALL_DOCUMENTS_"
+            f"{rera_doc_safe_name(project_name)}_"
+            f"{timestamp}.zip"
+        )
+
+        zip_path = os.path.join(
+            RERA_DOCUMENT_ZIP_DIR,
+            zip_filename,
+        )
+
+        used_names = set()
+        downloaded_count = 0
+        downloaded = []
+        failed = []
+
+        with zipfile.ZipFile(
+            zip_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+
+            for index, document in enumerate(documents, start=1):
+                try:
+                    body, content_type = rera_download_one_document(
+                        context,
+                        details_page,
+                        document,
+                    )
+
+                    filename = rera_doc_guess_filename(
+                        document.get("filename")
+                        or document.get("label"),
+                        document.get("url"),
+                        content_type,
+                    )
+
+                    section = rera_doc_safe_name(
+                        document.get("section", "Project Details")
+                    )
+
+                    archive_name = (
+                        f"{index:03d}_{section}_{filename}"
+                    )
+
+                    while archive_name in used_names:
+                        root, ext = os.path.splitext(archive_name)
+                        archive_name = f"{root}_{index}{ext}"
+
+                    used_names.add(archive_name)
+
+                    zip_file.writestr(
+                        archive_name,
+                        body,
+                    )
+
+                    downloaded_count += 1
+                    downloaded.append(
+                        {
+                            "label": document.get("label", ""),
+                            "section": document.get("section", ""),
+                            "filename": archive_name,
+                            "url": document.get("url", ""),
+                        }
+                    )
+
+                except Exception as error:
+                    failed.append(
+                        {
+                            "label": document.get("label"),
+                            "filename": document.get("filename"),
+                            "section": document.get("section"),
+                            "url": document.get("url", ""),
+                            "error": str(error),
+                        }
+                    )
+
+            not_downloaded = []
+
+            for item in not_applicable_documents:
+                not_downloaded.append(
+                    {
+                        "status": "NOT APPLICABLE",
+                        "label": item.get("label", ""),
+                        "section": item.get("section", ""),
+                        "filename": item.get("filename", ""),
+                        "reason": "Marked as NOT APPLICABLE in RERA portal",
+                    }
+                )
+
+            for item in failed:
+                not_downloaded.append(
+                    {
+                        "status": "FAILED",
+                        "label": item.get("label", ""),
+                        "section": item.get("section", ""),
+                        "filename": item.get("filename", ""),
+                        "url": item.get("url", ""),
+                        "reason": item.get("error", ""),
+                    }
+                )
+
+            report = {
+                "project": {
+                    "registrationNumber":
+                        payload.get("registrationNumber"),
+                    "projectName":
+                        payload.get("projectName"),
+                    "promoterName":
+                        payload.get("promoterName"),
+                },
+                "expected_document_types":
+                    globals().get("RERA_EXPECTED_DOCUMENT_TYPES", []),
+                "found_candidates_count":
+                    len(candidates),
+                "downloaded_count":
+                    len(downloaded),
+                "failed_count":
+                    len(failed),
+                "not_applicable_count":
+                    len(not_applicable_documents),
+                "not_downloaded_count":
+                    len(not_downloaded),
+                "downloaded":
+                    downloaded,
+                "failed":
+                    failed,
+                "not_applicable":
+                    not_applicable_documents,
+                "not_downloaded":
+                    not_downloaded,
+            }
+
+            zip_file.writestr(
+                "00_DOWNLOAD_REPORT.json",
+                json.dumps(report, indent=2, ensure_ascii=False),
+            )
+
+            summary_text = [
+                "Karnataka RERA Document Download Summary",
+                "",
+                f"Project Name: {payload.get('projectName', '')}",
+                f"Promoter Name: {payload.get('promoterName', '')}",
+                f"Registration Number: {payload.get('registrationNumber', '')}",
+                "",
+                f"Detected documents: {len(documents)}",
+                f"Downloaded documents: {downloaded_count}",
+                f"Failed documents: {len(failed)}",
+                f"Not applicable documents: {len(not_applicable_documents)}",
+                "",
+                "Note: NOT APPLICABLE files were skipped.",
+                "",
+            ]
+
+            if failed:
+                summary_text.append("Failed Items:")
+                for item in failed:
+                    summary_text.append(
+                        f"- {item.get('section')} | "
+                        f"{item.get('label')} | "
+                        f"{item.get('error')}"
+                    )
+
+            zip_file.writestr(
+                "DOWNLOAD_SUMMARY.txt",
+                "\n".join(summary_text),
+            )
+
+        return zip_path, zip_filename
+
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+@app.post("/api/rera/download-all-documents")
+def rera_download_all_documents_endpoint(
+    data: ReraAllDocumentsZipRequest,
+):
+    try:
+        zip_path, zip_filename = rera_create_all_documents_zip(
+            data.model_dump()
+        )
+
+        return FileResponse(
+            path=zip_path,
+            media_type="application/zip",
+            filename=zip_filename,
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+def rera_doc_safe_name(value):
+    value = rera_clean_text(value)
+
+    value = re.sub(
+        r'[<>:"/\\|?*\x00-\x1F]+',
+        "_",
+        value,
+    )
+
+    value = re.sub(
+        r"\s+",
+        "_",
+        value,
+    ).strip("._")
+
+    return (
+        value or "document"
+    )[:120]
+
+
+def rera_doc_is_not_applicable(value):
+    text = rera_normalize(value)
+
+    return (
+        "not applicable" in text
+        or "not_applicable" in text
+        or "notapplicable" in text
+    )
+
+
+def rera_doc_extension_from_content_type(content_type):
+    content_type = (
+        content_type or ""
+    ).lower()
+
+    if "application/pdf" in content_type:
+        return ".pdf"
+
+    if "image/jpeg" in content_type:
+        return ".jpg"
+
+    if "image/png" in content_type:
+        return ".png"
+
+    if "image/webp" in content_type:
+        return ".webp"
+
+    if (
+        "application/vnd.ms-excel"
+        in content_type
+        or
+        "spreadsheet"
+        in content_type
+    ):
+        return ".xlsx"
+
+    if "wordprocessingml" in content_type:
+        return ".docx"
+
+    guessed = mimetypes.guess_extension(
+        content_type.split(";")[0].strip()
+    )
+
+    return guessed or ".bin"
+
+
+def rera_doc_guess_filename(label, url, content_type=""):
+    label = rera_clean_text(label)
+
+    if label:
+        filename = label
+
+    else:
+        filename = ""
+
+        if url:
+            try:
+                filename = os.path.basename(
+                    unquote(
+                        url.split("?")[0]
+                    )
+                )
+            except Exception:
+                filename = ""
+
+    filename = filename or "document"
+
+    filename = rera_doc_safe_name(filename)
+
+    root, ext = os.path.splitext(filename)
+
+    if not ext:
+        ext = rera_doc_extension_from_content_type(
+            content_type
+        )
+
+        filename = f"{root}{ext}"
+
+    return filename
+
+
+def rera_open_selected_project_details(
+    payload,
+):
+    """
+    Opens RERA completed projects page, searches selected
+    project and opens its Project Registration Details page.
+    """
+
+    registration_number = rera_clean_text(
+        payload.get(
+            "registrationNumber",
+            "",
+        )
+    )
+
+    project_name = rera_clean_text(
+        payload.get(
+            "projectName",
+            "",
+        )
+    )
+
+    promoter_name = rera_clean_text(
+        payload.get(
+            "promoterName",
+            "",
+        )
+    )
+
+    if not registration_number and not project_name:
+        raise RuntimeError(
+            "registrationNumber or projectName is required."
+        )
+
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright, browser, context = create_rera_browser(
+            headless=payload.get(
+                "headless",
+                True,
+            )
+        )
+
+        list_page = open_rera_portal(
+            context
+        )
+
+        fill_rera_search(
+            list_page,
+            registration_number or project_name,
+        )
+
+        marked = mark_rera_details_icon(
+            list_page,
+            registration_number,
+            project_name,
+            promoter_name,
+        )
+
+        if not marked.get("success") and project_name:
+            fill_rera_search(
+                list_page,
+                project_name,
+            )
+
+            marked = mark_rera_details_icon(
+                list_page,
+                registration_number,
+                project_name,
+                promoter_name,
+            )
+
+        if not marked.get("success"):
+            raise RuntimeError(
+                marked.get("reason")
+                or
+                "View Project Details icon not found."
+            )
+
+        pages_before = list(
+            context.pages
+        )
+
+        target = list_page.locator(
+            "[data-rera-details-target='true']"
+        ).first
+
+        target.wait_for(
+            state="visible",
+            timeout=30000,
+        )
+
+        target.click(
+            force=True,
+            no_wait_after=True,
+        )
+
+        details_page = wait_for_rera_details_page(
+            context,
+            list_page,
+            pages_before,
+        )
+
+        wait_for_page_stable(
+            details_page
+        )
+
+        return playwright, browser, context, details_page
+
+    except Exception:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+        raise
+
+
+def rera_click_all_detail_tabs(page):
+    """
+    Loads all RERA project-detail tabs before extracting links.
+    """
+
+    tab_selectors = [
+        ".nav-tabs a",
+        "a[data-toggle='tab']",
+        "a[data-bs-toggle='tab']",
+        "button[data-bs-toggle='tab']",
+        "button[data-toggle='tab']",
+    ]
+
+    for selector in tab_selectors:
+        tabs = page.locator(
+            selector
+        )
+
+        count = tabs.count()
+
+        for index in range(count):
+            tab = tabs.nth(index)
+
+            try:
+                if tab.is_visible():
+                    tab.click(
+                        force=True,
+                        no_wait_after=True,
+                    )
+
+                    page.wait_for_timeout(
+                        900
+                    )
+
+            except Exception:
+                continue
+
+    page.evaluate(
+        """
+        () => {
+            document.querySelectorAll(
+                ".tab-pane, .collapse, .accordion-collapse, " +
+                ".panel-collapse, [hidden]"
+            ).forEach(element => {
+                element.hidden = false;
+
+                element.removeAttribute("aria-hidden");
+
+                element.style.setProperty(
+                    "display",
+                    "block",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "visibility",
+                    "visible",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "opacity",
+                    "1",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "height",
+                    "auto",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "max-height",
+                    "none",
+                    "important"
+                );
+
+                element.style.setProperty(
+                    "overflow",
+                    "visible",
+                    "important"
+                );
+            });
+        }
+        """
+    )
+
+    page.wait_for_timeout(
+        1200
+    )
+
+
+def rera_extract_downloadable_links(page):
+    """
+    Finds all downloadable PDF/image/document links from
+    the selected RERA Project Registration Details page.
+    """
+
+    rera_click_all_detail_tabs(
+        page
+    )
+
+    documents = page.evaluate(
+        r"""
+        () => {
+            const clean = value =>
+                (value || "")
+                    .normalize("NFKC")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+            const normalize = value =>
+                clean(value).toLowerCase();
+
+            const heading = Array.from(
+                document.querySelectorAll(
+                    "h1, h2, h3, h4, h5, div, span"
+                )
+            ).find(element =>
+                normalize(
+                    element.innerText ||
+                    element.textContent
+                ) === "project registration details"
+            );
+
+            let root = null;
+
+            if (heading) {
+                root = heading.closest(
+                    ".modal, [role='dialog']"
+                );
+
+                if (!root) {
+                    let current = heading.parentElement;
+
+                    while (
+                        current &&
+                        current !== document.body
+                    ) {
+                        const text = normalize(
+                            current.innerText ||
+                            current.textContent
+                        );
+
+                        const count = [
+                            "project registration details",
+                            "promoter details",
+                            "project details",
+                            "land details",
+                            "uploaded documents",
+                            "bank details"
+                        ].filter(marker =>
+                            text.includes(marker)
+                        ).length;
+
+                        if (count >= 3) {
+                            root = current;
+                            break;
+                        }
+
+                        current = current.parentElement;
+                    }
+                }
+            }
+
+            if (!root) {
+                root = document.body;
+            }
+
+            const elements = Array.from(
+                root.querySelectorAll(
+                    "a[href], button, input[type='button'], " +
+                    "input[type='submit'], [onclick], img[src]"
+                )
+            );
+
+            const output = [];
+            let counter = 0;
+
+            for (const element of elements) {
+                const tagName =
+                    element.tagName.toLowerCase();
+
+                const text = clean(
+                    element.innerText ||
+                    element.textContent ||
+                    element.value ||
+                    element.title ||
+                    element.alt ||
+                    element.getAttribute("aria-label") ||
+                    ""
+                );
+
+                const href =
+                    element.href ||
+                    element.src ||
+                    element.getAttribute("href") ||
+                    element.getAttribute("src") ||
+                    element.getAttribute("data") ||
+                    "";
+
+                const onclick =
+                    element.getAttribute("onclick") ||
+                    "";
+
+                const combined = normalize(
+                    [
+                        text,
+                        href,
+                        onclick,
+                        element.outerHTML || ""
+                    ].join(" ")
+                );
+
+                if (
+                    combined.includes("not applicable") ||
+                    combined.includes("not_applicable") ||
+                    combined.includes("notapplicable")
+                ) {
+                    continue;
+                }
+
+                const hasFileExtension =
+                    /\.(pdf|jpg|jpeg|png|webp|doc|docx|xls|xlsx|zip)(\?|$)/i
+                        .test(
+                            href || text || onclick
+                        );
+
+                const looksLikeDocument =
+                    hasFileExtension ||
+                    combined.includes("annexure") ||
+                    combined.includes("certificate") ||
+                    combined.includes("licence") ||
+                    combined.includes("license") ||
+                    combined.includes("approval") ||
+                    combined.includes("noc") ||
+                    combined.includes("plan") ||
+                    combined.includes("drawing") ||
+                    combined.includes("uploaded document") ||
+                    combined.includes("download");
+
+                const ignoredUi =
+                    combined === "print" ||
+                    combined === "close" ||
+                    combined.includes("promoter details land details") ||
+                    combined.includes("project details bank details") ||
+                    combined.includes("quarterly updates") ||
+                    combined.includes("completion details");
+
+                if (
+                    !looksLikeDocument ||
+                    ignoredUi
+                ) {
+                    continue;
+                }
+
+                const tabPane =
+                    element.closest(".tab-pane");
+
+                let section = "";
+
+                if (tabPane && tabPane.id) {
+                    section = tabPane.id;
+                }
+
+                if (!section) {
+                    let current = element;
+
+                    while (
+                        current &&
+                        current !== root
+                    ) {
+                        const previous =
+                            current.previousElementSibling;
+
+                        if (previous) {
+                            const heading = previous.querySelector(
+                                "h1, h2, h3, h4, h5, .panel-title"
+                            );
+
+                            if (heading) {
+                                section = clean(
+                                    heading.innerText ||
+                                    heading.textContent
+                                );
+                                break;
+                            }
+                        }
+
+                        current = current.parentElement;
+                    }
+                }
+
+                section = section || "Project Details";
+
+                const url = href
+                    ? new URL(href, location.href).href
+                    : "";
+
+                let filename = text;
+
+                if (!filename && url) {
+                    try {
+                        filename = decodeURIComponent(
+                            url.split("?")[0].split("/").pop()
+                        );
+                    } catch (error) {
+                        filename = url.split("?")[0].split("/").pop();
+                    }
+                }
+
+                filename = filename || "document";
+
+                const id =
+                    "rera_doc_" + counter;
+
+                element.setAttribute(
+                    "data-rera-doc-id",
+                    id
+                );
+
+                output.push({
+                    id,
+                    label: text || filename,
+                    filename,
+                    section,
+                    url,
+                    tag: tagName,
+                    hasDirectUrl:
+                        Boolean(
+                            url &&
+                            !url.toLowerCase().startsWith("javascript:")
+                        ),
+                    onclick:
+                        Boolean(onclick)
+                });
+
+                counter += 1;
+            }
+
+            return output;
+        }
+        """
+    )
+
+    final_documents = []
+    seen = set()
+
+    for index, item in enumerate(documents):
+        label = rera_clean_text(
+            item.get("label", "")
+        )
+
+        filename = rera_clean_text(
+            item.get("filename", "")
+        )
+
+        section = rera_clean_text(
+            item.get("section", "Project Details")
+        )
+
+        url = rera_clean_text(
+            item.get("url", "")
+        )
+
+        if (
+            rera_doc_is_not_applicable(label)
+            or rera_doc_is_not_applicable(filename)
+            or rera_doc_is_not_applicable(url)
+        ):
+            continue
+
+        key = "|".join(
+            [
+                rera_normalize(section),
+                rera_normalize(label),
+                rera_normalize(filename),
+                rera_normalize(url),
+            ]
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        final_documents.append(
+            {
+                "id": item.get("id") or f"rera_doc_{index}",
+                "label": label or filename or f"Document {index + 1}",
+                "filename": filename or label or f"Document {index + 1}",
+                "section": section,
+                "url": url,
+                "hasDirectUrl": bool(item.get("hasDirectUrl")),
+                "onclick": bool(item.get("onclick")),
+            }
+        )
+
+    return final_documents
+
+
+def rera_download_document_bytes(
+    context,
+    page,
+    document,
+):
+    """
+    Downloads one document either by direct URL or by clicking
+    the link in the project-details page.
+    """
+
+    url = document.get("url", "")
+    doc_id = document.get("id", "")
+
+    # Direct URL download
+    if (
+        url
+        and not url.lower().startswith("javascript:")
+        and not url.endswith("#")
+    ):
+        try:
+            response = context.request.get(
+                url,
+                headers={
+                    "Referer": page.url,
+                },
+                timeout=60000,
+            )
+
+            if response.ok:
+                body = response.body()
+
+                content_type = (
+                    response.headers.get("content-type")
+                    or ""
+                )
+
+                if body and len(body) > 100:
+                    return body, content_type
+
+        except Exception:
+            pass
+
+    # Click-download fallback
+    if doc_id:
+        locator = page.locator(
+            f"[data-rera-doc-id='{doc_id}']"
+        ).first
+
+        try:
+            with page.expect_download(
+                timeout=20000
+            ) as download_info:
+                locator.click(
+                    force=True,
+                    no_wait_after=True,
+                )
+
+            download = download_info.value
+
+            download_path = download.path()
+
+            with open(
+                download_path,
+                "rb",
+            ) as file:
+                body = file.read()
+
+            suggested_name = (
+                download.suggested_filename
+                or document.get("filename")
+                or "document"
+            )
+
+            return body, mimetypes.guess_type(
+                suggested_name
+            )[0] or ""
+
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        f"Unable to download document: "
+        f"{document.get('label') or document.get('filename')}"
+    )
+
+
+def rera_find_documents_for_project(payload):
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright, browser, context, details_page = (
+            rera_open_selected_project_details(
+                payload
+            )
+        )
+
+        documents = rera_extract_downloadable_links(
+            details_page
+        )
+
+        return {
+            "success": True,
+            "count": len(documents),
+            "documents": documents,
+        }
+
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+def rera_create_documents_zip(payload):
+    requested_documents = payload.get(
+        "documents",
+        [],
+    )
+
+    if not requested_documents:
+        raise RuntimeError(
+            "No RERA documents selected."
+        )
+
+    requested_ids = {
+        str(item.get("id", ""))
+        for item in requested_documents
+        if item.get("id")
+    }
+
+    requested_urls = {
+        str(item.get("url", ""))
+        for item in requested_documents
+        if item.get("url")
+    }
+
+    requested_labels = {
+        rera_normalize(
+            item.get("label", "")
+        )
+        for item in requested_documents
+        if item.get("label")
+    }
+
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright, browser, context, details_page = (
+            rera_open_selected_project_details(
+                payload
+            )
+        )
+
+        all_documents = rera_extract_downloadable_links(
+            details_page
+        )
+
+        selected_documents = []
+
+        for doc in all_documents:
+            if (
+                doc.get("id") in requested_ids
+                or doc.get("url") in requested_urls
+                or rera_normalize(doc.get("label", "")) in requested_labels
+            ):
+                selected_documents.append(doc)
+
+        if not selected_documents:
+            raise RuntimeError(
+                "Selected document links were not found "
+                "after reopening the RERA details page."
+            )
+
+        timestamp = time.strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        project_name = payload.get(
+            "projectName",
+            "RERA_PROJECT",
+        )
+
+        zip_filename = (
+            f"RERA_DOCUMENTS_"
+            f"{rera_doc_safe_name(project_name)}_"
+            f"{timestamp}.zip"
+        )
+
+        zip_path = os.path.join(
+            RERA_DOCUMENT_ZIP_DIR,
+            zip_filename,
+        )
+
+        used_names = set()
+
+        with zipfile.ZipFile(
+            zip_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+
+            for index, doc in enumerate(
+                selected_documents,
+                start=1,
+            ):
+                body, content_type = (
+                    rera_download_document_bytes(
+                        context,
+                        details_page,
+                        doc,
+                    )
+                )
+
+                filename = rera_doc_guess_filename(
+                    doc.get("filename")
+                    or doc.get("label"),
+                    doc.get("url"),
+                    content_type,
+                )
+
+                section = rera_doc_safe_name(
+                    doc.get("section", "Project Details")
+                )
+
+                archive_name = (
+                    f"{index:03d}_{section}_{filename}"
+                )
+
+                while archive_name in used_names:
+                    root, ext = os.path.splitext(
+                        archive_name
+                    )
+
+                    archive_name = (
+                        f"{root}_{index}{ext}"
+                    )
+
+                used_names.add(
+                    archive_name
+                )
+
+                zip_file.writestr(
+                    archive_name,
+                    body,
+                )
+
+        return zip_path, zip_filename
+
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+# =========================================================
+# API ROUTES
+# =========================================================
 
 @app.post("/api/fetch-rtc/auto")
 def fetch_rtc_auto(data: BhoomiRequest):
@@ -2009,6 +5838,87 @@ def akarband_options(data: AkarbandOptionsRequest):
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
 
+@app.post("/api/rera/search")
+def rera_search_endpoint(data: ReraSearchRequest):
+    request_id = data.requestId
+    if request_id:
+        with RERA_CANCEL_LOCK:
+            RERA_CANCEL_EVENTS.setdefault(request_id, threading.Event())
+    try:
+        return search_rera_projects(
+            data.model_dump()
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+@app.post("/api/rera/cancel/{request_id}")
+def rera_cancel_endpoint(request_id: str):
+    with RERA_CANCEL_LOCK:
+        event = RERA_CANCEL_EVENTS.setdefault(
+            request_id, threading.Event()
+        )
+    if event is not None:
+        event.set()
+    return {"success": True, "cancelled": True}
+
+
+@app.post("/api/rera/project-pdf")
+def rera_project_pdf_endpoint(data: ReraProjectPdfRequest):
+    try:
+        return create_rera_project_pdf(
+            data.model_dump()
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+@app.post("/api/rera/documents")
+def rera_documents_endpoint(
+    data: ReraDocumentsRequest,
+):
+    try:
+        return rera_find_documents_for_project(
+            data.model_dump()
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+@app.post("/api/rera/documents/download")
+def rera_documents_download_endpoint(
+    data: ReraDocumentsZipRequest,
+):
+    try:
+        zip_path, zip_filename = (
+            rera_create_documents_zip(
+                data.model_dump()
+            )
+        )
+
+        return FileResponse(
+            path=zip_path,
+            media_type="application/zip",
+            filename=zip_filename,
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
 
 if __name__ == "__main__":
     uvicorn.run(

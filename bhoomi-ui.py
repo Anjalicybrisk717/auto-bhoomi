@@ -5,7 +5,7 @@ from ui.rtc_ui import render_rtc_ui
 from ui.mr_ui import render_mr_ui
 from ui.revenue_map_ui import render_revenue_map_ui
 from ui.akarband_ui import render_akarband_ui
-
+from ui.rera_ui import render_rera_ui
 
 API_BASE = "http://localhost:5000"
 
@@ -152,7 +152,7 @@ with tabs[0]:
             "BIAAPA",
             "BESCOM",
             "BWSSB",
-            "Karnataka RERA",
+            "RERA Search",
             "Private Facilitation Services",
         ],
     )
@@ -206,17 +206,24 @@ with tabs[0]:
                 master,
                 districts,
                 headless,
-          )
+            )
         elif bhoomi_service == "Akarband":
             render_akarband_ui(
                 API_BASE,
                 master,
                 districts,
                 headless,
-        )
+            )
 
         elif bhoomi_service != "Select Service":
             st.info(f"{bhoomi_service} automation will be added next.")
 
+    elif portal == "RERA Search":
+        render_rera_ui(
+            API_BASE,
+            master,
+            districts,
+            headless,
+        )
     elif portal != "Select Portal":
         st.info(f"{portal} automation will be added next.")

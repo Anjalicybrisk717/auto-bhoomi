@@ -132,7 +132,7 @@ def render_revenue_map_ui(api_base, master, districts, headless):
     if st.button(
         "🗺️ Download Revenue Map",
         disabled=disabled,
-        use_container_width=True,
+        width="stretch",
     ):
         try:
             with st.spinner("Fetching Revenue Map from Bhoomi..."):

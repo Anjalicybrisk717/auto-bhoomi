@@ -316,7 +316,7 @@ def show_pdf_download(
         data=pdf_bytes,
         file_name=filename,
         mime="application/pdf",
-        use_container_width=True,
+        width="stretch",
         type="primary",
         key=key,
     )
@@ -617,7 +617,7 @@ def render_land_service(
 
         clicked = st.button(
             f"{service_name} ಪಡೆಯಿರಿ",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             key=f"{prefix}_button",
         )
@@ -930,7 +930,7 @@ def render_akarband_ui():
 
         clicked = st.button(
             "ಆಕಾರಬಂದ್ ಪಡೆಯಿರಿ",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             key="akarband_fetch_button",
         )
@@ -1255,7 +1255,7 @@ def render_rera_ui():
         if st.button(
             "Search",
             key="rera_promoter_search",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=not promoter_query.strip(),
         ):
@@ -1282,7 +1282,7 @@ def render_rera_ui():
         if st.button(
             "Search",
             key="rera_project_search",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=not project_query.strip(),
         ):
@@ -1311,7 +1311,7 @@ def render_rera_ui():
         if st.button(
             "Search",
             key="rera_registration_search",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=not registration_query.strip(),
         ):
@@ -1387,7 +1387,7 @@ def render_rera_ui():
                     }
                     for row in results
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1430,7 +1430,7 @@ def render_rera_ui():
             if st.button(
                 "Open Details, Click Print and Create PDF",
                 key="rera_selected_create_pdf",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             ):
                 try:
